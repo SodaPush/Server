@@ -17,7 +17,8 @@ function randomToken(bytes = 32): string {
 async function derivePassword(password: string, salt: string): Promise<string> {
   const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", salt: encoder.encode(salt), iterations: 210_000, hash: "SHA-256" },
+    // Cloudflare Workers rejects PBKDF2 iteration counts above 100,000.
+    { name: "PBKDF2", salt: encoder.encode(salt), iterations: 100_000, hash: "SHA-256" },
     key,
     256
   );

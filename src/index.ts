@@ -441,19 +441,50 @@ app.post("/v1/users", async (c) => {
 app.patch("/v1/users/:userID", async (c) => {
   const user = await requireUser(c);
   if (user instanceof Response) return user;
-  if (user.role !== "owner") return errorResponse(c, 403, "forbidden", "Owner permission is required");
   const target = await c.env.SODAPUSH_DB.prepare("SELECT id,username,role,disabled_at,created_at,updated_at FROM users WHERE id=?1 LIMIT 1").bind(c.req.param("userID")).first<UserRow>();
   if (!target) return errorResponse(c, 404, "user_not_found", "User was not found");
+  const isOwnerActor = user.role === "owner";
+  if (!isOwnerActor && target.id !== user.id) return errorResponse(c, 403, "forbidden", "Users may only update their own account");
   const parsed = await jsonBody(c, 16 * 1024);
   if (parsed instanceof Response) return parsed;
   const roles: AppRole[] = ["admin", "developer", "viewer"];
-  if (!isRecord(parsed) || !hasOnlyKeys(parsed, ["role", "disabled"]) || Object.keys(parsed).length === 0 || (parsed.role !== undefined && (typeof parsed.role !== "string" || !roles.includes(parsed.role as AppRole))) || (parsed.disabled !== undefined && typeof parsed.disabled !== "boolean")) return errorResponse(c, 400, "invalid_user", "role or disabled must be valid");
-  if (target.role === "owner") return errorResponse(c, 409, "owner_immutable", "The owner account cannot be disabled or assigned another role");
+  if (!isRecord(parsed) || !hasOnlyKeys(parsed, ["username", "password", "currentPassword", "role", "disabled"]) || Object.keys(parsed).length === 0 || (parsed.username !== undefined && (!validString(parsed.username, 64) || !/^[A-Za-z0-9_.-]{3,64}$/.test(parsed.username))) || (parsed.password !== undefined && (!validString(parsed.password, 1024) || parsed.password.length < 12)) || (parsed.currentPassword !== undefined && !validString(parsed.currentPassword, 1024)) || (parsed.role !== undefined && (typeof parsed.role !== "string" || !roles.includes(parsed.role as AppRole))) || (parsed.disabled !== undefined && typeof parsed.disabled !== "boolean")) return errorResponse(c, 400, "invalid_user", "username, password, currentPassword, role, or disabled must be valid");
+  if (!isOwnerActor && (parsed.role !== undefined || parsed.disabled !== undefined)) return errorResponse(c, 403, "forbidden", "Users cannot change their own role or account status");
+  if (target.role === "owner" && (parsed.role !== undefined || parsed.disabled !== undefined)) return errorResponse(c, 409, "owner_immutable", "The owner account cannot be disabled or assigned another role");
+  const nextUsername = typeof parsed.username === "string" ? parsed.username : target.username;
+  if (nextUsername !== target.username && await c.env.SODAPUSH_DB.prepare("SELECT id FROM users WHERE username=?1 AND id<>?2 LIMIT 1").bind(nextUsername, target.id).first()) return errorResponse(c, 409, "username_exists", "Username is already in use");
   const nextRole = (parsed.role as AppRole | undefined) ?? target.role;
   const nextDisabledAt = parsed.disabled === undefined ? target.disabled_at : parsed.disabled ? new Date().toISOString() : null;
   const updatedAt = new Date().toISOString();
-  await c.env.SODAPUSH_DB.prepare("UPDATE users SET role=?1,disabled_at=?2,updated_at=?3 WHERE id=?4").bind(nextRole, nextDisabledAt, updatedAt, target.id).run();
-  return c.json({ user: userDTO({ ...target, role: nextRole, disabled_at: nextDisabledAt, updated_at: updatedAt }) });
+  const statements = [c.env.SODAPUSH_DB.prepare("UPDATE users SET username=?1,role=?2,disabled_at=?3,updated_at=?4 WHERE id=?5").bind(nextUsername, nextRole, nextDisabledAt, updatedAt, target.id)];
+  if (typeof parsed.password === "string") {
+    if (!isOwnerActor) {
+      const passwordRecord = await c.env.SODAPUSH_DB.prepare("SELECT password_hash,password_salt FROM users WHERE id=?1 LIMIT 1").bind(target.id).first<{ password_hash: string; password_salt: string }>();
+      if (!validString(parsed.currentPassword, 1024) || !passwordRecord || !await verifyPassword(parsed.currentPassword, passwordRecord.password_hash, passwordRecord.password_salt)) return errorResponse(c, 400, "invalid_current_password", "Current password is incorrect");
+    }
+    const password = await hashPassword(parsed.password);
+    statements.push(c.env.SODAPUSH_DB.prepare("UPDATE users SET password_hash=?1,password_salt=?2 WHERE id=?3").bind(password.hash, password.salt, target.id));
+    const currentToken = c.req.header("Authorization")?.slice(7).trim();
+    if (target.id === user.id && currentToken) {
+      statements.push(c.env.SODAPUSH_DB.prepare("UPDATE sessions SET revoked_at=?1 WHERE user_id=?2 AND token_hash<>?3 AND revoked_at IS NULL").bind(Math.floor(Date.now() / 1000), target.id, await sha256Base64Url(currentToken)));
+    } else {
+      statements.push(c.env.SODAPUSH_DB.prepare("UPDATE sessions SET revoked_at=?1 WHERE user_id=?2 AND revoked_at IS NULL").bind(Math.floor(Date.now() / 1000), target.id));
+    }
+  }
+  await c.env.SODAPUSH_DB.batch(statements);
+  return c.json({ user: userDTO({ ...target, username: nextUsername, role: nextRole, disabled_at: nextDisabledAt, updated_at: updatedAt }) });
+});
+
+app.get("/v1/apps/:appID/member-candidates", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  const appID = c.req.param("appID");
+  if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin"])) return errorResponse(c, 403, "forbidden", "Member management permission is required");
+  const rows = await c.env.SODAPUSH_DB.prepare(`SELECT users.id,users.username,users.role,users.disabled_at,users.created_at,users.updated_at
+    FROM users LEFT JOIN app_memberships ON app_memberships.user_id=users.id AND app_memberships.app_id=?1
+    WHERE users.role<>'owner' AND users.disabled_at IS NULL AND app_memberships.user_id IS NULL
+    ORDER BY users.username COLLATE NOCASE ASC`).bind(appID).all<UserRow>();
+  return c.json({ users: rows.results.map(userDTO) });
 });
 
 app.get("/v1/apps/:appID/members", async (c) => {

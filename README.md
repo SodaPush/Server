@@ -179,6 +179,10 @@ available in this runtime, accepted push jobs are processed inline.
 
 ## First-time provisioning
 
+> [!NOTE]
+>
+> You can use the client app to complete the bootstrap, or use curl below.
+
 Bootstrap exactly once:
 
 ```sh

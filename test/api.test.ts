@@ -185,6 +185,21 @@ describe("API contract", () => {
     });
     expect(createdUser.status).toBe(201);
     const developerID = (await createdUser.json() as { user: { id: string } }).user.id;
+    const editedUser = await request(`/v1/users/${developerID}`, {
+      method: "PATCH",
+      headers: { ...authorization, "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "renamed-developer", password: "updated-secure-password" }),
+    });
+    expect(editedUser.status).toBe(200);
+    expect((await editedUser.json() as { user: { username: string } }).user.username).toBe("renamed-developer");
+    expect((await request("/v1/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "developer", password: "another-secure-password" }),
+    })).status).toBe(401);
+
+    const candidates = await request(`/v1/apps/${appID}/member-candidates`, { headers: authorization });
+    expect((await candidates.json() as { users: Array<{ id: string }> }).users.map((candidate) => candidate.id)).toContain(developerID);
     const membership = await request(`/v1/apps/${appID}/members/${developerID}`, {
       method: "PUT",
       headers: { ...authorization, "Content-Type": "application/json" },
@@ -196,9 +211,22 @@ describe("API contract", () => {
     const developerLogin = await request("/v1/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: "developer", password: "another-secure-password" }),
+      body: JSON.stringify({ username: "renamed-developer", password: "updated-secure-password" }),
     });
+    expect(developerLogin.status).toBe(200);
     const developerToken = (await developerLogin.json() as { accessToken: string }).accessToken;
+    const rejectedPasswordChange = await request(`/v1/users/${developerID}`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${developerToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ password: "self-service-password", currentPassword: "wrong-password" }),
+    });
+    expect(rejectedPasswordChange.status).toBe(400);
+    const selfUpdate = await request(`/v1/users/${developerID}`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${developerToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "self-renamed", password: "self-service-password", currentPassword: "updated-secure-password" }),
+    });
+    expect(selfUpdate.status).toBe(200);
     const forbiddenUpdate = await request(`/v1/apps/${appID}`, {
       method: "PATCH",
       headers: { Authorization: `Bearer ${developerToken}`, "Content-Type": "application/json" },

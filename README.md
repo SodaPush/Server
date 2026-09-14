@@ -12,6 +12,7 @@ SodaPush Server is the API backend for the [SodaPush](https://github.com/SodaPus
 - Alert, background, Live Activity, and custom APNs payloads
 - Delivery history, result inspection, and deletion of completed push records
 - One immutable instance owner plus admin/developer/viewer roles and per-app membership
+- Self-service username/password updates plus owner-managed resets, with other sessions revoked after password changes
 
 ## Requirements
 
@@ -120,7 +121,7 @@ Supported targets are `{ "all": true }`, `installationIds`, `tags`, `languages`,
 - Registration keys: `GET|POST /v1/apps/:appID/registration-keys`, `DELETE /v1/apps/:appID/registration-keys/:keyID`
 - Devices: `GET /v1/apps/:appID/devices`, signed `PUT|DELETE /v1/apps/:appID/devices/:installationID`
 - Pushes: `GET|POST /v1/apps/:appID/pushes`, `GET|DELETE /v1/apps/:appID/pushes/:jobID`
-- Users/members: `GET|POST /v1/users`, `PATCH /v1/users/:userID`, `GET /v1/apps/:appID/members`, `PUT|DELETE /v1/apps/:appID/members/:userID`
+- Users/members: `GET|POST /v1/users`, `PATCH /v1/users/:userID`, `GET /v1/apps/:appID/member-candidates`, `GET /v1/apps/:appID/members`, `PUT|DELETE /v1/apps/:appID/members/:userID`
 
 SDK registration requests use `X-Soda-Key-ID`, `X-Soda-Timestamp`, `X-Soda-Nonce`, and `X-Soda-Signature`. The HMAC-SHA256 input covers method, canonical target, timestamp, nonce, and body hash.
 

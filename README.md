@@ -1,82 +1,28 @@
 # SodaPush Server
 
-SodaPush Server is the API-only backend for SodaPush. It registers Apple device
-tokens, stores APNs credentials, accepts push jobs, and records delivery results.
-There is no bundled web interface.
+SodaPush Server is the API backend for the [SodaPush](https://github.com/SodaPush/SodaPush) self-hosted Apple Push Notification service. Deploy the same Hono application on Cloudflare Workers with D1/Queues or on Node.js/Docker with SQLite. Operators use [SodaPush Admin](https://github.com/SodaPush/AdminClient-Swift); receiving apps use [SodaPush SDK](https://github.com/SodaPush/SDK-Swift).
 
-The same API supports two deployment models:
+## Capabilities
 
-- Cloudflare Workers with D1 and Queues
-- Self-hosted Node.js or Docker with SQLite/libSQL
-
-Operators use
-[SodaPush-Client_Swift](https://github.com/guoPhineas/SodaPush-Client_Swift)
-for day-to-day access. Business applications register devices through
-[SodaPush-SDK_Swift](https://github.com/guoPhineas/SodaPush-SDK_Swift).
+- Encrypted APNs keys, SDK registration secrets, and device tokens
+- Separate development (APNs sandbox) and production devices and credentials
+- Environment-specific default APNs keys plus per-push key selection
+- Device registration with platform metadata, preferred language, tags, and business user ID
+- Audience targeting by all active devices, installation IDs, tags, languages, or user IDs
+- Alert, background, Live Activity, and custom APNs payloads
+- Delivery history, result inspection, and deletion of completed push records
+- One immutable instance owner plus admin/developer/viewer roles and per-app membership
 
 ## Requirements
 
-- Node.js 20 or later
+- Node.js 20+
 - pnpm 11
-- A Cloudflare account for the Workers deployment, or Docker/Node.js for self-hosting
-- An Apple Developer Team ID, APNs Key ID, and `.p8` provider key
-- A random 32-byte base64url `MASTER_KEY`
-- A long, one-time `BOOTSTRAP_TOKEN`
+- Cloudflare for Workers deployment, or Docker/Node.js for self-hosting
+- Apple Team ID, APNs Key ID, and `.p8` signing key
+- Random 32-byte base64url `MASTER_KEY`
+- Long one-time `BOOTSTRAP_TOKEN`
 
-Never commit either secret. `MASTER_KEY` encrypts APNs private keys,
-registration secrets, and device tokens at rest. Losing or changing it makes
-existing encrypted records unreadable.
-
-## API
-
-Health and setup:
-
-- `GET /healthz`
-- `GET /readyz`
-- `GET /v1/bootstrap/status`
-- `POST /v1/bootstrap`
-
-Management API, authenticated with `Authorization: Bearer <access-token>`:
-
-- `POST /v1/auth/login`
-- `POST /v1/auth/logout`
-- `GET /v1/me`
-- `GET /v1/apps`
-- `POST /v1/apps`
-- `GET /v1/apps/:appID`
-- `PATCH /v1/apps/:appID`
-- `POST /v1/apps/:appID/apns-credential`
-- `GET|POST /v1/apps/:appID/apns-credentials`
-- `DELETE /v1/apps/:appID/apns-credentials/:credentialID`
-- `GET|POST /v1/apps/:appID/registration-keys`
-- `DELETE /v1/apps/:appID/registration-keys/:keyID`
-- `GET /v1/apps/:appID/devices`
-- `PATCH /v1/apps/:appID/devices/:installationID?environment=<environment>`
-- `GET /v1/apps/:appID/pushes`
-- `POST /v1/apps/:appID/pushes`
-- `GET /v1/apps/:appID/pushes/:jobID`
-- `GET|POST /v1/users`
-- `PATCH /v1/users/:userID`
-- `GET /v1/apps/:appID/members`
-- `PUT|DELETE /v1/apps/:appID/members/:userID`
-
-SDK API, authenticated with signed request headers:
-
-- `PUT /v1/apps/:appID/devices/:installationID`
-- `DELETE /v1/apps/:appID/devices/:installationID?environment=<environment>`
-
-Public JSON uses camelCase. SDK requests include `X-Soda-Key-ID`,
-`X-Soda-Timestamp`, `X-Soda-Nonce`, and `X-Soda-Signature`. The signature is
-HMAC-SHA256 over the method, canonical target, timestamp, nonce, and SHA-256
-body hash. For `DELETE`, the canonical target includes the `environment` query.
-
-App responses include the authenticated user's effective app role. Viewers can
-inspect devices and push results, developers can also create pushes, and app
-admins/owners can manage configuration, credentials, registration keys, and
-members. Instance owners manage user accounts. APNs private keys are never
-returned, and newly generated registration secrets are returned only by their
-creation request. Device IDs in management responses combine installation ID
-and environment so development and production registrations remain distinct.
+Never commit the two secrets. Losing `MASTER_KEY` makes encrypted records unreadable.
 
 ## Install and verify
 
@@ -85,26 +31,7 @@ pnpm install --frozen-lockfile
 pnpm check
 ```
 
-Tests cover the schema, security primitives, bootstrap, app creation, public
-response casing, signed registration, and environment-scoped unregistration.
-
-For local Worker development, create an uncommitted `.dev.vars`:
-
-```dotenv
-MASTER_KEY=<32-byte-base64url-key>
-BOOTSTRAP_TOKEN=<long-random-token>
-```
-
-Then run:
-
-```sh
-pnpm run db:migrate:local
-pnpm run dev
-```
-
-## Deploy to Cloudflare
-
-Authenticate and create the backing resources:
+## Cloudflare deployment
 
 ```sh
 pnpm exec wrangler login
@@ -113,47 +40,21 @@ pnpm exec wrangler queues create sodapush-pushes
 pnpm exec wrangler queues create sodapush-pushes-dlq
 ```
 
-Copy the D1 UUID returned by the first resource command into `database_id` in
-`wrangler.jsonc`. The Queue names must continue to match that file.
-
-Apply the production schema:
-
-```sh
-pnpm run db:migrate:remote
-```
-
-Create an uncommitted `.env.production` containing both required secrets:
+Put the D1 UUID in `wrangler.jsonc`. Create an uncommitted `.env.production`:
 
 ```dotenv
 MASTER_KEY=<32-byte-base64url-key>
 BOOTSTRAP_TOKEN=<long-random-token>
 ```
 
-Upload the secrets together with the Worker and verify readiness:
-
-```sh
-pnpm exec wrangler deploy --secrets-file .env.production
-curl https://<worker-host>/readyz
-```
-
-For a single command that applies remote D1 migrations before deploying the
-Worker, run:
+Then apply migrations and deploy:
 
 ```sh
 pnpm run deploy:production
+curl https://<worker-host>/readyz
 ```
 
-The command requires a configured `.env.production` containing non-empty
-`MASTER_KEY` and `BOOTSTRAP_TOKEN`, and uses the D1/Queue resources from
-`wrangler.jsonc`.
-
-The deployed Worker produces and consumes `sodapush-pushes`; exhausted retries
-are routed to `sodapush-pushes-dlq`. Configure a custom domain or Worker route
-after deployment if desired.
-
-## Deploy with Docker or Node.js
-
-Copy the provided environment template and replace every placeholder:
+## Docker or Node.js deployment
 
 ```sh
 cp .env.example .env
@@ -161,27 +62,9 @@ docker compose up --build -d
 curl http://127.0.0.1:8787/readyz
 ```
 
-The SQLite database is stored in the `sodapush-data` Docker volume. Back up this
-volume together with `MASTER_KEY`. Put a TLS reverse proxy in front of port 8787
-for production because the management client and SDK require HTTPS.
+The Docker volume stores SQLite data. Back it up together with `MASTER_KEY`, and place a TLS reverse proxy in front of port 8787 in production. Node startup applies all migrations automatically.
 
-To run Node.js without Docker:
-
-```sh
-PORT=8787 \
-MASTER_KEY='<32-byte-base64url-key>' \
-BOOTSTRAP_TOKEN='<long-random-token>' \
-pnpm run start:node
-```
-
-Node startup applies the idempotent schema. Since Cloudflare Queues are not
-available in this runtime, accepted push jobs are processed inline.
-
-## First-time provisioning
-
-> [!NOTE]
->
-> You can use the client app to complete the bootstrap, or use curl below.
+## Provisioning
 
 Bootstrap exactly once:
 
@@ -192,51 +75,67 @@ curl -X POST 'https://<server>/v1/bootstrap' \
   --data '{"username":"owner","password":"replace-with-a-long-password"}'
 ```
 
-Save the returned `accessToken`, then create an application:
+Create an app with the returned bearer token. The response contains an SDK registration secret shown only once:
 
 ```sh
 curl -X POST 'https://<server>/v1/apps' \
-  -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer <access-token>' \
+  -H 'Content-Type: application/json' \
   --data '{"name":"Example App","bundleID":"com.example.app"}'
 ```
 
-The response contains a registration key secret that is shown only once. Store
-its `app.id`, `registrationKey.keyID`, and `registrationKey.secret` in the
-business application's deployment configuration.
-
-Upload the APNs provider credential:
+Upload an environment-specific APNs key:
 
 ```sh
-curl -X POST 'https://<server>/v1/apps/<app-id>/apns-credential' \
-  -H 'Content-Type: application/json' \
+curl -X POST 'https://<server>/v1/apps/<app-id>/apns-credentials' \
   -H 'Authorization: Bearer <access-token>' \
-  --data-binary '{"teamID":"<team-id>","keyID":"<apns-key-id>","p8":"<private-key-pem>"}'
+  -H 'Content-Type: application/json' \
+  --data-binary '{"teamID":"<team-id>","keyID":"<key-id>","p8":"<private-key-pem>","environment":"production","makeDefault":true}'
 ```
 
-For multiline `.p8` data, generate the JSON body with a JSON-aware tool rather
-than manually escaping the PEM contents.
+Use a JSON-aware tool for multiline PEM content.
 
-## Security and reliability notes
+## Push targeting
 
-- APNs keys, registration secrets, and device tokens are AES-GCM encrypted.
-- Device-token hashes are stored separately for uniqueness checks.
-- Registration nonces expire and are removed during later signed requests.
-- Per-app membership is checked before accessing app resources.
-- An SDK registration credential is extractable from a sufficiently analyzed
-  application. Rotate it when necessary and add attestation if stronger device
-  authenticity is required.
-- Push processing avoids repeating recorded successful deliveries, but there is
-  still a narrow crash window between APNs acceptance and the database update.
+`POST /v1/apps/:appID/pushes` requires an environment, payload, and exactly one audience selector. `credentialID` is optional; omitting it uses the environment default.
 
-## Repository layout
+```json
+{
+  "environment": "production",
+  "credentialID": "optional-credential-id",
+  "pushType": "alert",
+  "target": { "tags": ["paid", "beta"] },
+  "payload": { "aps": { "alert": { "title": "Hello", "body": "Welcome back" } } }
+}
+```
 
-- `src/index.ts`: routes, authorization, registration, push processing, and Worker entry points
-- `src/auth.ts`: password hashing and expiring bearer sessions
-- `src/crypto.ts`: encryption, hashing, HMAC, base64url, and request IDs
-- `src/apns.ts`: APNs provider-token creation and delivery
-- `src/node.ts`: Node.js and libSQL runtime adapter
-- `migrations/`: D1/SQLite-compatible schema
-- `test/`: schema, security, and API contract tests
-- `wrangler.jsonc`: Worker, D1, Queue, and required-secret bindings
-- `Dockerfile` and `docker-compose.yml`: self-hosted container runtime
+Supported targets are `{ "all": true }`, `installationIds`, `tags`, `languages`, or `userIDs`. Multiple values within a selector use OR matching. Only active devices in the selected environment are eligible.
+
+## API summary
+
+- Health/setup: `GET /healthz`, `GET /readyz`, `GET /v1/bootstrap/status`, `POST /v1/bootstrap`
+- Authentication: `POST /v1/auth/login`, `POST /v1/auth/logout`, `GET /v1/me`
+- Apps: `GET|POST /v1/apps`, `GET|PATCH /v1/apps/:appID`
+- APNs credentials: `GET|POST /v1/apps/:appID/apns-credentials`, `PATCH|DELETE /v1/apps/:appID/apns-credentials/:credentialID`
+- Registration keys: `GET|POST /v1/apps/:appID/registration-keys`, `DELETE /v1/apps/:appID/registration-keys/:keyID`
+- Devices: `GET /v1/apps/:appID/devices`, signed `PUT|DELETE /v1/apps/:appID/devices/:installationID`
+- Pushes: `GET|POST /v1/apps/:appID/pushes`, `GET|DELETE /v1/apps/:appID/pushes/:jobID`
+- Users/members: `GET|POST /v1/users`, `PATCH /v1/users/:userID`, `GET /v1/apps/:appID/members`, `PUT|DELETE /v1/apps/:appID/members/:userID`
+
+SDK registration requests use `X-Soda-Key-ID`, `X-Soda-Timestamp`, `X-Soda-Nonce`, and `X-Soda-Signature`. The HMAC-SHA256 input covers method, canonical target, timestamp, nonce, and body hash.
+
+## Security notes
+
+- The owner is created only by bootstrap and cannot be added, disabled, demoted, or removed.
+- `.p8` material is never returned after upload; registration secrets are returned only once.
+- Successful deliveries are not repeated during queue retries, though a narrow crash window remains between APNs acceptance and persistence.
+- An SDK registration key embedded in an app is rotatable authorization, not device attestation.
+
+## Layout
+
+- `src/index.ts`: routes, authorization, registration, targeting, and queue processing
+- `src/apns.ts`: APNs authentication and delivery
+- `src/auth.ts`, `src/crypto.ts`: sessions and cryptography
+- `src/node.ts`: Node.js/libSQL adapter
+- `migrations/`: D1/SQLite schema
+- `test/`: API, schema, and security tests

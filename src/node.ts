@@ -48,6 +48,11 @@ async function main() {
   const migration = await readFile(new URL("../migrations/0001_initial.sql", import.meta.url), "utf8");
   const accountMigration = await readFile(new URL("../migrations/0002_accounts_pushes.sql", import.meta.url), "utf8");
   await client.executeMultiple(`${migration}\n${accountMigration}`);
+  const deviceColumns = await client.execute("PRAGMA table_info(devices)");
+  if (!deviceColumns.rows.some((column) => column.name === "language")) {
+    const targetingMigration = await readFile(new URL("../migrations/0003_targeting_and_credentials.sql", import.meta.url), "utf8");
+    await client.executeMultiple(targetingMigration);
+  }
   const port = Number(process.env.PORT ?? "8787");
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw new Error("PORT must be a valid TCP port");
   serve({ fetch: (request) => app.fetch(request, env), port }, (info) => {

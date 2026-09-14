@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "deploy": "wrangler deploy",
+    "deploy:production": "bash scripts/deploy-production.sh",
     "db:migrate:local": "wrangler d1 migrations apply SODAPUSH_DB --local",
     "db:migrate:remote": "wrangler d1 migrations apply SODAPUSH_DB --remote",
     "check": "pnpm typecheck && pnpm test"

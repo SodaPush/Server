@@ -136,6 +136,17 @@ pnpm exec wrangler deploy --secrets-file .env.production
 curl https://<worker-host>/readyz
 ```
 
+For a single command that applies remote D1 migrations before deploying the
+Worker, run:
+
+```sh
+pnpm run deploy:production
+```
+
+The command requires a configured `.env.production` containing non-empty
+`MASTER_KEY` and `BOOTSTRAP_TOKEN`, and uses the D1/Queue resources from
+`wrangler.jsonc`.
+
 The deployed Worker produces and consumes `sodapush-pushes`; exhausted retries
 are routed to `sodapush-pushes-dlq`. Configure a custom domain or Worker route
 after deployment if desired.

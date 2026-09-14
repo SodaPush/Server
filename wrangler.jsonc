@@ -1,0 +1,35 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sodapush-server",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-13",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "SODAPUSH_DB",
+      "database_name": "sodapush-db",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    "APP_VERSION": "0.1.0"
+  },
+  "secrets": {
+    "required": ["MASTER_KEY", "BOOTSTRAP_TOKEN"]
+  },
+  "queues": {
+    "producers": [
+      { "binding": "PUSH_QUEUE", "queue": "sodapush-pushes" }
+    ],
+    "consumers": [
+      {
+        "queue": "sodapush-pushes",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "sodapush-pushes-dlq"
+      }
+    ]
+  }
+}

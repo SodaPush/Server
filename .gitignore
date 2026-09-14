@@ -127,6 +127,8 @@ dist
 
 # pnpm
 .pnpm-store
+.wrangler/
+.DS_Store
 
 # yarn v3
 .pnp.*

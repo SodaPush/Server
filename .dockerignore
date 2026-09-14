@@ -1,0 +1,7 @@
+.git
+.wrangler
+.pnpm-store
+node_modules
+data
+*.log
+.env*

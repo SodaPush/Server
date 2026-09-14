@@ -39,12 +39,26 @@ Health and setup:
 Management API, authenticated with `Authorization: Bearer <access-token>`:
 
 - `POST /v1/auth/login`
+- `POST /v1/auth/logout`
 - `GET /v1/me`
 - `GET /v1/apps`
 - `POST /v1/apps`
+- `GET /v1/apps/:appID`
+- `PATCH /v1/apps/:appID`
 - `POST /v1/apps/:appID/apns-credential`
+- `GET|POST /v1/apps/:appID/apns-credentials`
+- `DELETE /v1/apps/:appID/apns-credentials/:credentialID`
+- `GET|POST /v1/apps/:appID/registration-keys`
+- `DELETE /v1/apps/:appID/registration-keys/:keyID`
 - `GET /v1/apps/:appID/devices`
+- `PATCH /v1/apps/:appID/devices/:installationID?environment=<environment>`
+- `GET /v1/apps/:appID/pushes`
 - `POST /v1/apps/:appID/pushes`
+- `GET /v1/apps/:appID/pushes/:jobID`
+- `GET|POST /v1/users`
+- `PATCH /v1/users/:userID`
+- `GET /v1/apps/:appID/members`
+- `PUT|DELETE /v1/apps/:appID/members/:userID`
 
 SDK API, authenticated with signed request headers:
 
@@ -55,6 +69,14 @@ Public JSON uses camelCase. SDK requests include `X-Soda-Key-ID`,
 `X-Soda-Timestamp`, `X-Soda-Nonce`, and `X-Soda-Signature`. The signature is
 HMAC-SHA256 over the method, canonical target, timestamp, nonce, and SHA-256
 body hash. For `DELETE`, the canonical target includes the `environment` query.
+
+App responses include the authenticated user's effective app role. Viewers can
+inspect devices and push results, developers can also create pushes, and app
+admins/owners can manage configuration, credentials, registration keys, and
+members. Instance owners manage user accounts. APNs private keys are never
+returned, and newly generated registration secrets are returned only by their
+creation request. Device IDs in management responses combine installation ID
+and environment so development and production registrations remain distinct.
 
 ## Install and verify
 

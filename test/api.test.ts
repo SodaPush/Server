@@ -84,7 +84,7 @@ describe("API contract", () => {
   });
 
   it("registers and unregisters only the signed environment", async () => {
-    const { appID, keyID, secret } = await createApplication();
+    const { appID, keyID, secret, accessToken } = await createApplication();
     const installationID = "d1b28f5a-f77b-44d5-a00a-68b6529e553a";
     const path = `/v1/apps/${appID}/devices/${installationID}`;
     const registrationBody = JSON.stringify({
@@ -94,6 +94,10 @@ describe("API contract", () => {
     });
     const registration = await signedRequest(path, "PUT", registrationBody, keyID, secret);
     expect(registration.status).toBe(200);
+
+    const devices = await request(`/v1/apps/${appID}/devices`, { headers: { Authorization: `Bearer ${accessToken}` } });
+    const device = (await devices.json() as { devices: Array<Record<string, unknown>> }).devices[0];
+    expect(device).toMatchObject({ id: `${installationID}:production`, installationID, appVersion: null, status: "active" });
 
     const canonicalTarget = `${path}?environment=production`;
     const removal = await signedRequest(canonicalTarget, "DELETE", "", keyID, secret);
@@ -105,7 +109,88 @@ describe("API contract", () => {
     expect(row.rows[0]?.status).toBe("inactive");
   });
 
-  async function createApplication(): Promise<{ appID: string; keyID: string; secret: string }> {
+  it("supports the practical management lifecycle without exposing stored secrets", async () => {
+    const { appID, accessToken } = await createApplication();
+    const authorization = { Authorization: `Bearer ${accessToken}` };
+
+    const apps = await request("/v1/apps", { headers: authorization });
+    expect((await apps.json() as { apps: Array<{ role: string }> }).apps[0]?.role).toBe("owner");
+
+    const updated = await request(`/v1/apps/${appID}`, {
+      method: "PATCH",
+      headers: { ...authorization, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Renamed" }),
+    });
+    expect(updated.status).toBe(200);
+    expect((await updated.json() as { app: { name: string } }).app.name).toBe("Renamed");
+
+    await client.batch([
+      { sql: "INSERT INTO push_jobs(id,app_id,environment,request_json,status,total_count,success_count,failure_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", args: ["job-1", appID, "production", JSON.stringify({ pushType: "alert", target: { all: true }, payload: { aps: { alert: "Hi" } } }), "partial", 2, 1, 1, "now", "now"] },
+      { sql: "INSERT INTO deliveries(id,job_id,device_id,status,apns_status,reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", args: ["delivery-1", "job-1", "device-1", "failed", 410, "Unregistered", "now", "now"] },
+    ]);
+    const pushes = await request(`/v1/apps/${appID}/pushes`, { headers: authorization });
+    expect((await pushes.json() as { pushes: Array<{ id: string }> }).pushes[0]?.id).toBe("job-1");
+    const push = await request(`/v1/apps/${appID}/pushes/job-1`, { headers: authorization });
+    const pushBody = await push.json() as { push: { failureCount: number }; deliveries: Array<{ reason: string }> };
+    expect(pushBody.push.failureCount).toBe(1);
+    expect(pushBody.deliveries[0]?.reason).toBe("Unregistered");
+
+    const apns = await request(`/v1/apps/${appID}/apns-credentials`, {
+      method: "POST",
+      headers: { ...authorization, "Content-Type": "application/json" },
+      body: JSON.stringify({ teamID: "TEAM123", keyID: "KEY123", p8: "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----" }),
+    });
+    expect(apns.status).toBe(200);
+    expect(await apns.json()).not.toHaveProperty("credential.p8");
+    const credentials = await request(`/v1/apps/${appID}/apns-credentials`, { headers: authorization });
+    expect(JSON.stringify(await credentials.json())).not.toContain("PRIVATE KEY");
+
+    const registration = await request(`/v1/apps/${appID}/registration-keys`, { method: "POST", headers: authorization });
+    expect(registration.status).toBe(201);
+    expect((await registration.json() as { registrationKey: { secret: string } }).registrationKey.secret).toBeTruthy();
+    const keyList = await request(`/v1/apps/${appID}/registration-keys`, { headers: authorization });
+    expect(JSON.stringify(await keyList.json())).not.toContain("secret");
+
+    const createdUser = await request("/v1/users", {
+      method: "POST",
+      headers: { ...authorization, "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "developer", password: "another-secure-password", role: "developer" }),
+    });
+    expect(createdUser.status).toBe(201);
+    const developerID = (await createdUser.json() as { user: { id: string } }).user.id;
+    const membership = await request(`/v1/apps/${appID}/members/${developerID}`, {
+      method: "PUT",
+      headers: { ...authorization, "Content-Type": "application/json" },
+      body: JSON.stringify({ role: "developer" }),
+    });
+    expect(membership.status).toBe(200);
+    expect((await membership.json() as { member: { role: string } }).member.role).toBe("developer");
+
+    const developerLogin = await request("/v1/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "developer", password: "another-secure-password" }),
+    });
+    const developerToken = (await developerLogin.json() as { accessToken: string }).accessToken;
+    const forbiddenUpdate = await request(`/v1/apps/${appID}`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${developerToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Not Allowed" }),
+    });
+    expect(forbiddenUpdate.status).toBe(403);
+
+    const lastOwner = await request(`/v1/users/${(await client.execute("SELECT id FROM users WHERE role='owner'")).rows[0]?.id}`, {
+      method: "PATCH",
+      headers: { ...authorization, "Content-Type": "application/json" },
+      body: JSON.stringify({ disabled: true }),
+    });
+    expect(lastOwner.status).toBe(409);
+
+    expect((await request("/v1/auth/logout", { method: "POST", headers: authorization })).status).toBe(204);
+    expect((await request("/v1/me", { headers: authorization })).status).toBe(401);
+  });
+
+  async function createApplication(): Promise<{ appID: string; keyID: string; secret: string; accessToken: string }> {
     const bootstrap = await request("/v1/bootstrap", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Soda-Bootstrap-Token": "bootstrap-test-token" },
@@ -121,7 +206,7 @@ describe("API contract", () => {
       app: { id: string };
       registrationKey: { keyID: string; secret: string };
     };
-    return { appID: body.app.id, ...body.registrationKey };
+    return { appID: body.app.id, accessToken, ...body.registrationKey };
   }
 
   async function signedRequest(canonicalTarget: string, method: string, body: string, keyID: string, secret: string): Promise<Response> {

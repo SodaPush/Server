@@ -9,6 +9,14 @@ type AppContext = Context<{ Bindings: Env }>;
 type AppRole = "owner" | "admin" | "developer" | "viewer";
 interface PushMessage { jobID: string }
 
+interface AppRecord {
+  id: string;
+  name: string;
+  bundle_id: string;
+  created_at: string;
+  disabled_at: string | null;
+}
+
 export const app = new Hono<{ Bindings: Env }>();
 
 function errorResponse(c: AppContext, status: number, code: string, message: string) {
@@ -44,6 +52,25 @@ async function appRole(env: Env, user: SessionUser, appID: string): Promise<AppR
 }
 
 function hasRole(role: AppRole | null, allowed: AppRole[]): boolean { return role !== null && allowed.includes(role); }
+
+function appDTO(row: AppRecord, role: AppRole) {
+  return { id: row.id, name: row.name, bundleID: row.bundle_id, role, createdAt: row.created_at, disabledAt: row.disabled_at };
+}
+
+async function findApp(env: Env, appID: string): Promise<AppRecord | null> {
+  return env.SODAPUSH_DB.prepare("SELECT id,name,bundle_id,created_at,disabled_at FROM apps WHERE id=?1 LIMIT 1").bind(appID).first<AppRecord>();
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: string[]): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function parsedPushRequest(value: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return isRecord(parsed) ? parsed : null;
+  } catch { return null; }
+}
 
 app.get("/healthz", (c) => c.json({ status: "ok", version: c.env.APP_VERSION ?? "unknown" }));
 app.get("/readyz", async (c) => {
@@ -88,6 +115,15 @@ app.post("/v1/auth/login", async (c) => {
   return c.json({ user: { id: user.id, username: user.username, role: user.role }, accessToken });
 });
 
+app.post("/v1/auth/logout", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  const token = c.req.header("Authorization")?.slice(7).trim();
+  if (!token) return errorResponse(c, 401, "unauthorized", "Authentication is required");
+  await c.env.SODAPUSH_DB.prepare("UPDATE sessions SET revoked_at=?1 WHERE token_hash=?2 AND revoked_at IS NULL").bind(Math.floor(Date.now() / 1000), await sha256Base64Url(token)).run();
+  return c.body(null, 204);
+});
+
 app.get("/v1/me", async (c) => {
   const user = await requireUser(c);
   return user instanceof Response ? user : c.json({ user });
@@ -97,11 +133,11 @@ app.get("/v1/apps", async (c) => {
   const user = await requireUser(c);
   if (user instanceof Response) return user;
   const query = user.role === "owner"
-    ? "SELECT id, name, bundle_id, created_at, disabled_at FROM apps ORDER BY created_at DESC"
-    : `SELECT apps.id, apps.name, apps.bundle_id, apps.created_at, apps.disabled_at FROM apps JOIN app_memberships ON app_memberships.app_id = apps.id WHERE app_memberships.user_id = ?1 ORDER BY apps.created_at DESC`;
+    ? "SELECT id, name, bundle_id, created_at, disabled_at, 'owner' AS effective_role FROM apps ORDER BY created_at DESC"
+    : `SELECT apps.id, apps.name, apps.bundle_id, apps.created_at, apps.disabled_at, app_memberships.role AS effective_role FROM apps JOIN app_memberships ON app_memberships.app_id = apps.id WHERE app_memberships.user_id = ?1 ORDER BY apps.created_at DESC`;
   const statement = c.env.SODAPUSH_DB.prepare(query);
-  const rows = await (user.role === "owner" ? statement : statement.bind(user.id)).all<{ id: string; name: string; bundle_id: string; created_at: string; disabled_at: string | null }>();
-  return c.json({ apps: rows.results.map((row) => ({ id: row.id, name: row.name, bundleID: row.bundle_id, createdAt: row.created_at, disabledAt: row.disabled_at })) });
+  const rows = await (user.role === "owner" ? statement : statement.bind(user.id)).all<AppRecord & { effective_role: AppRole }>();
+  return c.json({ apps: rows.results.map((row) => appDTO(row, row.effective_role)) });
 });
 
 app.post("/v1/apps", async (c) => {
@@ -112,6 +148,7 @@ app.post("/v1/apps", async (c) => {
   if (parsed instanceof Response) return parsed;
   if (!isRecord(parsed) || !validString(parsed.name, 128) || !validString(parsed.bundleID, 255) || !/^[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)+$/.test(parsed.bundleID)) return errorResponse(c, 400, "invalid_app", "A valid name and bundleID are required");
   const appID = crypto.randomUUID();
+  const registrationKeyID = crypto.randomUUID();
   const keyID = `reg_${randomToken(8)}`;
   const registrationSecret = randomToken(32);
   const encrypted = await encryptSecret(c.env.MASTER_KEY, registrationSecret);
@@ -119,23 +156,108 @@ app.post("/v1/apps", async (c) => {
   await c.env.SODAPUSH_DB.batch([
     c.env.SODAPUSH_DB.prepare("INSERT INTO apps (id, name, bundle_id, created_at) VALUES (?1, ?2, ?3, ?4)").bind(appID, parsed.name, parsed.bundleID, now),
     c.env.SODAPUSH_DB.prepare("INSERT INTO app_memberships (user_id, app_id, role, created_at) VALUES (?1, ?2, 'owner', ?3)").bind(user.id, appID, now),
-    c.env.SODAPUSH_DB.prepare("INSERT INTO registration_keys (id, app_id, key_id, secret_ciphertext, secret_nonce, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(crypto.randomUUID(), appID, keyID, encrypted.ciphertext, encrypted.nonce, now),
+    c.env.SODAPUSH_DB.prepare("INSERT INTO registration_keys (id, app_id, key_id, secret_ciphertext, secret_nonce, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(registrationKeyID, appID, keyID, encrypted.ciphertext, encrypted.nonce, now),
   ]);
-  return c.json({ app: { id: appID, name: parsed.name, bundleID: parsed.bundleID, createdAt: now, disabledAt: null }, registrationKey: { keyID, secret: registrationSecret } }, 201);
+  return c.json({ app: { id: appID, name: parsed.name, bundleID: parsed.bundleID, role: "owner", createdAt: now, disabledAt: null }, registrationKey: { id: registrationKeyID, keyID, secret: registrationSecret, active: true, createdAt: now, revokedAt: null } }, 201);
 });
 
-app.post("/v1/apps/:appID/apns-credential", async (c) => {
+app.get("/v1/apps/:appID", async (c) => {
   const user = await requireUser(c);
   if (user instanceof Response) return user;
-  const appID = c.req.param("appID");
+  const appID = c.req.param("appID"), role = await appRole(c.env, user, appID);
+  if (!hasRole(role, ["owner", "admin", "developer", "viewer"])) return errorResponse(c, 403, "forbidden", "App access is required");
+  const record = await findApp(c.env, appID);
+  if (!record) return errorResponse(c, 404, "app_not_found", "App was not found");
+  return c.json({ app: appDTO(record, role!) });
+});
+
+app.patch("/v1/apps/:appID", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  const appID = c.req.param("appID"), role = await appRole(c.env, user, appID);
+  if (!hasRole(role, ["owner", "admin"])) return errorResponse(c, 403, "forbidden", "App management permission is required");
+  const existing = await findApp(c.env, appID);
+  if (!existing) return errorResponse(c, 404, "app_not_found", "App was not found");
+  const parsed = await jsonBody(c, 16 * 1024);
+  if (parsed instanceof Response) return parsed;
+  if (!isRecord(parsed) || !hasOnlyKeys(parsed, ["name", "disabled"]) || Object.keys(parsed).length === 0 || (parsed.name !== undefined && !validString(parsed.name, 128)) || (parsed.disabled !== undefined && typeof parsed.disabled !== "boolean")) return errorResponse(c, 400, "invalid_app", "name or disabled must be valid");
+  const name = typeof parsed.name === "string" ? parsed.name : existing.name;
+  const disabledAt = parsed.disabled === undefined ? existing.disabled_at : parsed.disabled ? new Date().toISOString() : null;
+  await c.env.SODAPUSH_DB.prepare("UPDATE apps SET name=?1,disabled_at=?2 WHERE id=?3").bind(name, disabledAt, appID).run();
+  return c.json({ app: appDTO({ ...existing, name, disabled_at: disabledAt }, role!) });
+});
+
+async function createAPNsCredential(c: AppContext, legacyResponse = false) {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  const appID = c.req.param("appID") ?? "";
   if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin"])) return errorResponse(c, 403, "forbidden", "APNs credential management permission is required");
+  if (!await findApp(c.env, appID)) return errorResponse(c, 404, "app_not_found", "App was not found");
   const parsed = await jsonBody(c, 40 * 1024);
   if (parsed instanceof Response) return parsed;
   if (!isRecord(parsed) || !validString(parsed.teamID, 32) || !validString(parsed.keyID, 32) || !validString(parsed.p8, 32_000) || !parsed.p8.includes("PRIVATE KEY")) return errorResponse(c, 400, "invalid_credential", "teamID, keyID and a valid p8 are required");
   const encrypted = await encryptSecret(c.env.MASTER_KEY, parsed.p8);
+  const credentialID = crypto.randomUUID();
   const now = new Date().toISOString();
-  await c.env.SODAPUSH_DB.prepare(`INSERT INTO apns_credentials (id, app_id, team_id, key_id, p8_ciphertext, p8_nonce, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) ON CONFLICT(app_id, key_id) DO UPDATE SET team_id=excluded.team_id,p8_ciphertext=excluded.p8_ciphertext,p8_nonce=excluded.p8_nonce,updated_at=excluded.updated_at`).bind(crypto.randomUUID(), appID, parsed.teamID, parsed.keyID, encrypted.ciphertext, encrypted.nonce, now).run();
-  return c.json({ appID, teamID: parsed.teamID, keyID: parsed.keyID, updatedAt: now });
+  await c.env.SODAPUSH_DB.prepare(`INSERT INTO apns_credentials (id, app_id, team_id, key_id, p8_ciphertext, p8_nonce, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) ON CONFLICT(app_id, key_id) DO UPDATE SET team_id=excluded.team_id,p8_ciphertext=excluded.p8_ciphertext,p8_nonce=excluded.p8_nonce,updated_at=excluded.updated_at`).bind(credentialID, appID, parsed.teamID, parsed.keyID, encrypted.ciphertext, encrypted.nonce, now).run();
+  const stored = await c.env.SODAPUSH_DB.prepare("SELECT id,team_id,key_id,created_at,updated_at FROM apns_credentials WHERE app_id=?1 AND key_id=?2 LIMIT 1").bind(appID, parsed.keyID).first<{ id: string; team_id: string; key_id: string; created_at: string; updated_at: string }>();
+  const credential = { id: stored!.id, teamID: stored!.team_id, keyID: stored!.key_id, createdAt: stored!.created_at, updatedAt: stored!.updated_at };
+  return legacyResponse ? c.json({ appID, teamID: credential.teamID, keyID: credential.keyID, updatedAt: credential.updatedAt }) : c.json({ credential });
+}
+
+app.post("/v1/apps/:appID/apns-credential", (c) => createAPNsCredential(c, true));
+app.post("/v1/apps/:appID/apns-credentials", (c) => createAPNsCredential(c));
+
+app.get("/v1/apps/:appID/apns-credentials", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  const appID = c.req.param("appID");
+  if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin", "developer", "viewer"])) return errorResponse(c, 403, "forbidden", "App access is required");
+  const rows = await c.env.SODAPUSH_DB.prepare("SELECT id,team_id,key_id,created_at,updated_at FROM apns_credentials WHERE app_id=?1 ORDER BY updated_at DESC").bind(appID).all<{ id: string; team_id: string; key_id: string; created_at: string; updated_at: string }>();
+  return c.json({ credentials: rows.results.map((row) => ({ id: row.id, teamID: row.team_id, keyID: row.key_id, createdAt: row.created_at, updatedAt: row.updated_at })) });
+});
+
+app.delete("/v1/apps/:appID/apns-credentials/:credentialID", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  const appID = c.req.param("appID");
+  if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin"])) return errorResponse(c, 403, "forbidden", "APNs credential management permission is required");
+  const credential = await c.env.SODAPUSH_DB.prepare("SELECT id FROM apns_credentials WHERE app_id=?1 AND id=?2 LIMIT 1").bind(appID, c.req.param("credentialID")).first<{ id: string }>();
+  if (!credential) return errorResponse(c, 404, "credential_not_found", "APNs credential was not found");
+  await c.env.SODAPUSH_DB.prepare("DELETE FROM apns_credentials WHERE app_id=?1 AND id=?2").bind(appID, credential.id).run();
+  return c.body(null, 204);
+});
+
+app.get("/v1/apps/:appID/registration-keys", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  const appID = c.req.param("appID");
+  if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin"])) return errorResponse(c, 403, "forbidden", "Registration key management permission is required");
+  const rows = await c.env.SODAPUSH_DB.prepare("SELECT id,key_id,active,created_at,revoked_at FROM registration_keys WHERE app_id=?1 ORDER BY created_at DESC").bind(appID).all<{ id: string; key_id: string; active: number; created_at: string; revoked_at: string | null }>();
+  return c.json({ registrationKeys: rows.results.map((row) => ({ id: row.id, keyID: row.key_id, active: row.active === 1, createdAt: row.created_at, revokedAt: row.revoked_at })) });
+});
+
+app.post("/v1/apps/:appID/registration-keys", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  const appID = c.req.param("appID");
+  if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin"])) return errorResponse(c, 403, "forbidden", "Registration key management permission is required");
+  if (!await findApp(c.env, appID)) return errorResponse(c, 404, "app_not_found", "App was not found");
+  const id = crypto.randomUUID(), keyID = `reg_${randomToken(8)}`, secret = randomToken(32), now = new Date().toISOString();
+  const encrypted = await encryptSecret(c.env.MASTER_KEY, secret);
+  await c.env.SODAPUSH_DB.prepare("INSERT INTO registration_keys (id,app_id,key_id,secret_ciphertext,secret_nonce,created_at) VALUES (?1,?2,?3,?4,?5,?6)").bind(id, appID, keyID, encrypted.ciphertext, encrypted.nonce, now).run();
+  return c.json({ registrationKey: { id, keyID, secret, active: true, createdAt: now, revokedAt: null } }, 201);
+});
+
+app.delete("/v1/apps/:appID/registration-keys/:keyID", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  const appID = c.req.param("appID"), keyID = c.req.param("keyID");
+  if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin"])) return errorResponse(c, 403, "forbidden", "Registration key management permission is required");
+  const key = await c.env.SODAPUSH_DB.prepare("SELECT id FROM registration_keys WHERE app_id=?1 AND key_id=?2 LIMIT 1").bind(appID, keyID).first<{ id: string }>();
+  if (!key) return errorResponse(c, 404, "registration_key_not_found", "Registration key was not found");
+  await c.env.SODAPUSH_DB.prepare("UPDATE registration_keys SET active=0,revoked_at=?1 WHERE id=?2").bind(new Date().toISOString(), key.id).run();
+  return c.body(null, 204);
 });
 
 app.get("/v1/apps/:appID/devices", async (c) => {
@@ -143,8 +265,29 @@ app.get("/v1/apps/:appID/devices", async (c) => {
   if (user instanceof Response) return user;
   const appID = c.req.param("appID");
   if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin", "developer", "viewer"])) return errorResponse(c, 403, "forbidden", "App access is required");
-  const rows = await c.env.SODAPUSH_DB.prepare("SELECT installation_id, environment, platform, status, updated_at FROM devices WHERE app_id=?1 ORDER BY updated_at DESC LIMIT 500").bind(appID).all<{ installation_id: string; environment: string; platform: string; status: string; updated_at: string }>();
-  return c.json({ devices: rows.results.map((row) => ({ id: row.installation_id, installationID: row.installation_id, environment: row.environment, platform: row.platform, status: row.status, updatedAt: row.updated_at })) });
+  const rows = await c.env.SODAPUSH_DB.prepare("SELECT installation_id,environment,platform,app_version,app_build,locale,time_zone,status,created_at,updated_at FROM devices WHERE app_id=?1 ORDER BY updated_at DESC LIMIT 500").bind(appID).all<{ installation_id: string; environment: string; platform: string; app_version: string | null; app_build: string | null; locale: string | null; time_zone: string | null; status: string; created_at: string; updated_at: string }>();
+  return c.json({ devices: rows.results.map(deviceDTO) });
+});
+
+function deviceDTO(row: { installation_id: string; environment: string; platform: string; app_version: string | null; app_build: string | null; locale: string | null; time_zone: string | null; status: string; created_at: string; updated_at: string }) {
+  return { id: `${row.installation_id}:${row.environment}`, installationID: row.installation_id, environment: row.environment, platform: row.platform, appVersion: row.app_version, appBuild: row.app_build, locale: row.locale, timeZone: row.time_zone, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at };
+}
+
+app.patch("/v1/apps/:appID/devices/:installationID", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  const appID = c.req.param("appID"), installationID = c.req.param("installationID"), environment = c.req.query("environment");
+  if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin"])) return errorResponse(c, 403, "forbidden", "Device management permission is required");
+  if (!installationPattern.test(installationID)) return errorResponse(c, 400, "invalid_installation_id", "installationID must be a UUID");
+  if (environment !== "development" && environment !== "production") return errorResponse(c, 400, "invalid_environment", "environment query parameter is required");
+  const parsed = await jsonBody(c, 16 * 1024);
+  if (parsed instanceof Response) return parsed;
+  if (!isRecord(parsed) || !hasOnlyKeys(parsed, ["status"]) || parsed.status !== "inactive") return errorResponse(c, 400, "invalid_device", "Only status inactive is supported");
+  const existing = await c.env.SODAPUSH_DB.prepare("SELECT installation_id,environment,platform,app_version,app_build,locale,time_zone,status,created_at,updated_at FROM devices WHERE app_id=?1 AND installation_id=?2 AND environment=?3 LIMIT 1").bind(appID, installationID, environment).first<{ installation_id: string; environment: string; platform: string; app_version: string | null; app_build: string | null; locale: string | null; time_zone: string | null; status: string; created_at: string; updated_at: string }>();
+  if (!existing) return errorResponse(c, 404, "device_not_found", "Device was not found");
+  const updatedAt = new Date().toISOString();
+  await c.env.SODAPUSH_DB.prepare("UPDATE devices SET status='inactive',updated_at=?1 WHERE app_id=?2 AND installation_id=?3 AND environment=?4").bind(updatedAt, appID, installationID, environment).run();
+  return c.json({ device: deviceDTO({ ...existing, status: "inactive", updated_at: updatedAt }) });
 });
 
 app.post("/v1/apps/:appID/pushes", async (c) => {
@@ -165,6 +308,123 @@ app.post("/v1/apps/:appID/pushes", async (c) => {
   if (c.env.PUSH_QUEUE) await c.env.PUSH_QUEUE.send({ jobID }); else await processPushJob(c.env, jobID);
   const state = await c.env.SODAPUSH_DB.prepare("SELECT status FROM push_jobs WHERE id=?1").bind(jobID).first<{ status: string }>();
   return c.json({ jobID, status: state?.status ?? "queued" }, 202);
+});
+
+interface PushJobRow {
+  id: string; app_id: string; environment: string; request_json: string; status: string;
+  total_count: number; success_count: number; failure_count: number; created_by: string | null;
+  created_at: string; updated_at: string;
+}
+
+function pushJobDTO(row: PushJobRow) {
+  const request = parsedPushRequest(row.request_json);
+  return { id: row.id, appID: row.app_id, environment: row.environment, pushType: request?.pushType ?? null, target: request?.target ?? null, payload: request?.payload ?? null, status: row.status, totalCount: row.total_count, successCount: row.success_count, failureCount: row.failure_count, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at };
+}
+
+app.get("/v1/apps/:appID/pushes", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  const appID = c.req.param("appID");
+  if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin", "developer", "viewer"])) return errorResponse(c, 403, "forbidden", "App access is required");
+  const rows = await c.env.SODAPUSH_DB.prepare("SELECT id,app_id,environment,request_json,status,total_count,success_count,failure_count,created_by,created_at,updated_at FROM push_jobs WHERE app_id=?1 ORDER BY created_at DESC LIMIT 100").bind(appID).all<PushJobRow>();
+  return c.json({ pushes: rows.results.map(pushJobDTO) });
+});
+
+app.get("/v1/apps/:appID/pushes/:jobID", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  const appID = c.req.param("appID");
+  if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin", "developer", "viewer"])) return errorResponse(c, 403, "forbidden", "App access is required");
+  const row = await c.env.SODAPUSH_DB.prepare("SELECT id,app_id,environment,request_json,status,total_count,success_count,failure_count,created_by,created_at,updated_at FROM push_jobs WHERE app_id=?1 AND id=?2 LIMIT 1").bind(appID, c.req.param("jobID")).first<PushJobRow>();
+  if (!row) return errorResponse(c, 404, "push_not_found", "Push job was not found");
+  const deliveries = await c.env.SODAPUSH_DB.prepare("SELECT id,device_id,apns_id,status,apns_status,reason,created_at,updated_at FROM deliveries WHERE job_id=?1 ORDER BY created_at ASC").bind(row.id).all<{ id: string; device_id: string | null; apns_id: string | null; status: string; apns_status: number | null; reason: string | null; created_at: string; updated_at: string }>();
+  return c.json({ push: pushJobDTO(row), deliveries: deliveries.results.map((delivery) => ({ id: delivery.id, deviceID: delivery.device_id, apnsID: delivery.apns_id, status: delivery.status, apnsStatus: delivery.apns_status, reason: delivery.reason, createdAt: delivery.created_at, updatedAt: delivery.updated_at })) });
+});
+
+interface UserRow { id: string; username: string; role: AppRole; disabled_at: string | null; created_at: string; updated_at: string }
+function userDTO(row: UserRow) { return { id: row.id, username: row.username, role: row.role, disabledAt: row.disabled_at, createdAt: row.created_at, updatedAt: row.updated_at }; }
+
+app.get("/v1/users", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  if (user.role !== "owner") return errorResponse(c, 403, "forbidden", "Owner permission is required");
+  const rows = await c.env.SODAPUSH_DB.prepare("SELECT id,username,role,disabled_at,created_at,updated_at FROM users ORDER BY created_at ASC").all<UserRow>();
+  return c.json({ users: rows.results.map(userDTO) });
+});
+
+app.post("/v1/users", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  if (user.role !== "owner") return errorResponse(c, 403, "forbidden", "Owner permission is required");
+  const parsed = await jsonBody(c, 16 * 1024);
+  if (parsed instanceof Response) return parsed;
+  const roles: AppRole[] = ["owner", "admin", "developer", "viewer"];
+  if (!isRecord(parsed) || !hasOnlyKeys(parsed, ["username", "password", "role"]) || !validString(parsed.username, 64) || !/^[A-Za-z0-9_.-]{3,64}$/.test(parsed.username) || !validString(parsed.password, 1024) || parsed.password.length < 12 || typeof parsed.role !== "string" || !roles.includes(parsed.role as AppRole)) return errorResponse(c, 400, "invalid_user", "Username, password, or role is invalid");
+  if (await c.env.SODAPUSH_DB.prepare("SELECT id FROM users WHERE username=?1 LIMIT 1").bind(parsed.username).first()) return errorResponse(c, 409, "username_exists", "Username is already in use");
+  const id = crypto.randomUUID(), password = await hashPassword(parsed.password), now = new Date().toISOString();
+  await c.env.SODAPUSH_DB.prepare("INSERT INTO users (id,username,password_hash,password_salt,role,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?6)").bind(id, parsed.username, password.hash, password.salt, parsed.role, now).run();
+  return c.json({ user: { id, username: parsed.username, role: parsed.role, disabledAt: null, createdAt: now, updatedAt: now } }, 201);
+});
+
+app.patch("/v1/users/:userID", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  if (user.role !== "owner") return errorResponse(c, 403, "forbidden", "Owner permission is required");
+  const target = await c.env.SODAPUSH_DB.prepare("SELECT id,username,role,disabled_at,created_at,updated_at FROM users WHERE id=?1 LIMIT 1").bind(c.req.param("userID")).first<UserRow>();
+  if (!target) return errorResponse(c, 404, "user_not_found", "User was not found");
+  const parsed = await jsonBody(c, 16 * 1024);
+  if (parsed instanceof Response) return parsed;
+  const roles: AppRole[] = ["owner", "admin", "developer", "viewer"];
+  if (!isRecord(parsed) || !hasOnlyKeys(parsed, ["role", "disabled"]) || Object.keys(parsed).length === 0 || (parsed.role !== undefined && (typeof parsed.role !== "string" || !roles.includes(parsed.role as AppRole))) || (parsed.disabled !== undefined && typeof parsed.disabled !== "boolean")) return errorResponse(c, 400, "invalid_user", "role or disabled must be valid");
+  const nextRole = (parsed.role as AppRole | undefined) ?? target.role;
+  const nextDisabledAt = parsed.disabled === undefined ? target.disabled_at : parsed.disabled ? new Date().toISOString() : null;
+  if (target.role === "owner" && target.disabled_at === null && (nextRole !== "owner" || nextDisabledAt !== null)) {
+    const count = await c.env.SODAPUSH_DB.prepare("SELECT COUNT(*) AS count FROM users WHERE role='owner' AND disabled_at IS NULL").first<{ count: number }>();
+    if ((count?.count ?? 0) <= 1) return errorResponse(c, 409, "last_owner", "The last active owner cannot be disabled or demoted");
+  }
+  const updatedAt = new Date().toISOString();
+  await c.env.SODAPUSH_DB.prepare("UPDATE users SET role=?1,disabled_at=?2,updated_at=?3 WHERE id=?4").bind(nextRole, nextDisabledAt, updatedAt, target.id).run();
+  return c.json({ user: userDTO({ ...target, role: nextRole, disabled_at: nextDisabledAt, updated_at: updatedAt }) });
+});
+
+app.get("/v1/apps/:appID/members", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  const appID = c.req.param("appID");
+  if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin", "developer", "viewer"])) return errorResponse(c, 403, "forbidden", "App access is required");
+  const rows = await c.env.SODAPUSH_DB.prepare("SELECT users.id,users.username,app_memberships.role,users.disabled_at,app_memberships.created_at FROM app_memberships JOIN users ON users.id=app_memberships.user_id WHERE app_memberships.app_id=?1 ORDER BY app_memberships.created_at ASC").bind(appID).all<{ id: string; username: string; role: AppRole; disabled_at: string | null; created_at: string }>();
+  return c.json({ members: rows.results.map((row) => ({ id: row.id, userID: row.id, username: row.username, role: row.role, disabledAt: row.disabled_at, createdAt: row.created_at })) });
+});
+
+app.put("/v1/apps/:appID/members/:userID", async (c) => {
+  const actor = await requireUser(c);
+  if (actor instanceof Response) return actor;
+  const appID = c.req.param("appID"), userID = c.req.param("userID");
+  if (!hasRole(await appRole(c.env, actor, appID), ["owner", "admin"])) return errorResponse(c, 403, "forbidden", "Member management permission is required");
+  const parsed = await jsonBody(c, 16 * 1024);
+  if (parsed instanceof Response) return parsed;
+  const roles: AppRole[] = ["admin", "developer", "viewer"];
+  if (!isRecord(parsed) || !hasOnlyKeys(parsed, ["role"]) || typeof parsed.role !== "string" || !roles.includes(parsed.role as AppRole)) return errorResponse(c, 400, "invalid_member", "Member role must be admin, developer, or viewer");
+  const target = await c.env.SODAPUSH_DB.prepare("SELECT id,username,disabled_at FROM users WHERE id=?1 LIMIT 1").bind(userID).first<{ id: string; username: string; disabled_at: string | null }>();
+  if (!target) return errorResponse(c, 404, "user_not_found", "User was not found");
+  if (target.disabled_at !== null) return errorResponse(c, 409, "user_disabled", "A disabled user cannot be added to an app");
+  const existing = await c.env.SODAPUSH_DB.prepare("SELECT role,created_at FROM app_memberships WHERE app_id=?1 AND user_id=?2 LIMIT 1").bind(appID, userID).first<{ role: AppRole; created_at: string }>();
+  if (existing?.role === "owner") return errorResponse(c, 409, "owner_membership", "The app owner membership cannot be changed");
+  const createdAt = existing?.created_at ?? new Date().toISOString();
+  await c.env.SODAPUSH_DB.prepare("INSERT INTO app_memberships (app_id,user_id,role,created_at) VALUES (?1,?2,?3,?4) ON CONFLICT(app_id,user_id) DO UPDATE SET role=excluded.role").bind(appID, userID, parsed.role, createdAt).run();
+  return c.json({ member: { id: target.id, userID: target.id, username: target.username, role: parsed.role, disabledAt: null, createdAt } });
+});
+
+app.delete("/v1/apps/:appID/members/:userID", async (c) => {
+  const actor = await requireUser(c);
+  if (actor instanceof Response) return actor;
+  const appID = c.req.param("appID"), userID = c.req.param("userID");
+  if (!hasRole(await appRole(c.env, actor, appID), ["owner", "admin"])) return errorResponse(c, 403, "forbidden", "Member management permission is required");
+  const existing = await c.env.SODAPUSH_DB.prepare("SELECT role FROM app_memberships WHERE app_id=?1 AND user_id=?2 LIMIT 1").bind(appID, userID).first<{ role: AppRole }>();
+  if (!existing) return errorResponse(c, 404, "member_not_found", "App member was not found");
+  if (existing.role === "owner") return errorResponse(c, 409, "owner_membership", "The app owner membership cannot be removed");
+  await c.env.SODAPUSH_DB.prepare("DELETE FROM app_memberships WHERE app_id=?1 AND user_id=?2").bind(appID, userID).run();
+  return c.body(null, 204);
 });
 
 function signedError(status: number, code: string, message: string): Response {

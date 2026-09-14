@@ -20,7 +20,10 @@ export interface DeviceRegistrationRequest {
     appVersion?: string | null;
     appBuild?: string | null;
     locale?: string | null;
+    language?: string | null;
     timeZone?: string | null;
+    userID?: string | null;
+    tags?: string[];
   };
 }
 

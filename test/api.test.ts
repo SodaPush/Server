@@ -50,7 +50,8 @@ describe("API contract", () => {
     client = createClient({ url: ":memory:" });
     const initial = await readFile(new URL("../migrations/0001_initial.sql", import.meta.url), "utf8");
     const accounts = await readFile(new URL("../migrations/0002_accounts_pushes.sql", import.meta.url), "utf8");
-    await client.executeMultiple(`${initial}\n${accounts}`);
+    const targeting = await readFile(new URL("../migrations/0003_targeting_and_credentials.sql", import.meta.url), "utf8");
+    await client.executeMultiple(`${initial}\n${accounts}\n${targeting}`);
     env = {
       SODAPUSH_DB: new TestDatabase(client) as unknown as D1Database,
       MASTER_KEY: Buffer.alloc(32, 7).toString("base64url"),
@@ -90,14 +91,14 @@ describe("API contract", () => {
     const registrationBody = JSON.stringify({
       deviceToken: "00abff",
       environment: "production",
-      context: { platform: "iOS" },
+      context: { platform: "iOS", language: "en", userID: "customer-42", tags: ["beta", "paid"] },
     });
     const registration = await signedRequest(path, "PUT", registrationBody, keyID, secret);
     expect(registration.status).toBe(200);
 
     const devices = await request(`/v1/apps/${appID}/devices`, { headers: { Authorization: `Bearer ${accessToken}` } });
     const device = (await devices.json() as { devices: Array<Record<string, unknown>> }).devices[0];
-    expect(device).toMatchObject({ id: `${installationID}:production`, installationID, appVersion: null, status: "active" });
+    expect(device).toMatchObject({ id: `${installationID}:production`, installationID, appVersion: null, language: "en", userID: "customer-42", tags: ["beta", "paid"], status: "active" });
 
     const canonicalTarget = `${path}?environment=production`;
     const removal = await signedRequest(canonicalTarget, "DELETE", "", keyID, secret);
@@ -138,12 +139,38 @@ describe("API contract", () => {
     const apns = await request(`/v1/apps/${appID}/apns-credentials`, {
       method: "POST",
       headers: { ...authorization, "Content-Type": "application/json" },
-      body: JSON.stringify({ teamID: "TEAM123", keyID: "KEY123", p8: "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----" }),
+      body: JSON.stringify({ teamID: "TEAM123", keyID: "KEY123", p8: "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----", environment: "production", makeDefault: true }),
     });
     expect(apns.status).toBe(200);
-    expect(await apns.json()).not.toHaveProperty("credential.p8");
+    const apnsBody = await apns.json() as { credential: { id: string; environment: string; isDefault: boolean } };
+    expect(apnsBody).not.toHaveProperty("credential.p8");
+    expect(apnsBody.credential).toMatchObject({ environment: "production", isDefault: true });
     const credentials = await request(`/v1/apps/${appID}/apns-credentials`, { headers: authorization });
     expect(JSON.stringify(await credentials.json())).not.toContain("PRIVATE KEY");
+
+    const targetedPush = await request(`/v1/apps/${appID}/pushes`, {
+      method: "POST",
+      headers: { ...authorization, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        environment: "production",
+        credentialID: apnsBody.credential.id,
+        pushType: "alert",
+        target: { tags: ["beta", "paid"] },
+        payload: { aps: { alert: { title: "Hello", body: "World" } } },
+      }),
+    });
+    expect(targetedPush.status).toBe(202);
+    const targetedPushID = (await targetedPush.json() as { jobID: string }).jobID;
+    const targetedDetail = await request(`/v1/apps/${appID}/pushes/${targetedPushID}`, { headers: authorization });
+    expect((await targetedDetail.json() as { push: { credentialID: string; target: { tags: string[] } } }).push)
+      .toMatchObject({ credentialID: apnsBody.credential.id, target: { tags: ["beta", "paid"] } });
+
+    const extraOwner = await request("/v1/users", {
+      method: "POST",
+      headers: { ...authorization, "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "second-owner", password: "another-secure-password", role: "owner" }),
+    });
+    expect(extraOwner.status).toBe(400);
 
     const registration = await request(`/v1/apps/${appID}/registration-keys`, { method: "POST", headers: authorization });
     expect(registration.status).toBe(201);
@@ -185,6 +212,11 @@ describe("API contract", () => {
       body: JSON.stringify({ disabled: true }),
     });
     expect(lastOwner.status).toBe(409);
+    expect((await lastOwner.json() as { code: string }).code).toBe("owner_immutable");
+
+    const deletedPush = await request(`/v1/apps/${appID}/pushes/job-1`, { method: "DELETE", headers: authorization });
+    expect(deletedPush.status).toBe(204);
+    expect((await client.execute({ sql: "SELECT COUNT(*) AS count FROM deliveries WHERE job_id=?", args: ["job-1"] })).rows[0]?.count).toBe(0);
 
     expect((await request("/v1/auth/logout", { method: "POST", headers: authorization })).status).toBe(204);
     expect((await request("/v1/me", { headers: authorization })).status).toBe(401);

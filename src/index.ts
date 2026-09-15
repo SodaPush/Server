@@ -187,7 +187,7 @@ app.get("/v1/apps/:appID", async (c) => {
   return c.json({ app: appDTO(record, role!) });
 });
 
-app.patch("/v1/apps/:appID", async (c) => {
+app.post("/v1/apps/:appID/update", async (c) => {
   const user = await requireUser(c);
   if (user instanceof Response) return user;
   const appID = c.req.param("appID"), role = await appRole(c.env, user, appID);
@@ -239,7 +239,7 @@ app.get("/v1/apps/:appID/apns-credentials", async (c) => {
   return c.json({ credentials: rows.results.map(credentialDTO) });
 });
 
-app.patch("/v1/apps/:appID/apns-credentials/:credentialID", async (c) => {
+app.post("/v1/apps/:appID/apns-credentials/:credentialID/default", async (c) => {
   const user = await requireUser(c);
   if (user instanceof Response) return user;
   const appID = c.req.param("appID"), credentialID = c.req.param("credentialID");
@@ -257,7 +257,7 @@ app.patch("/v1/apps/:appID/apns-credentials/:credentialID", async (c) => {
   return c.json({ credential: credentialDTO({ ...credential, is_default: 1, updated_at: updatedAt }) });
 });
 
-app.delete("/v1/apps/:appID/apns-credentials/:credentialID", async (c) => {
+app.post("/v1/apps/:appID/apns-credentials/:credentialID/delete", async (c) => {
   const user = await requireUser(c);
   if (user instanceof Response) return user;
   const appID = c.req.param("appID");
@@ -293,7 +293,7 @@ app.post("/v1/apps/:appID/registration-keys", async (c) => {
   return c.json({ registrationKey: { id, keyID, secret, active: true, createdAt: now, revokedAt: null } }, 201);
 });
 
-app.delete("/v1/apps/:appID/registration-keys/:keyID", async (c) => {
+app.post("/v1/apps/:appID/registration-keys/:keyID/revoke", async (c) => {
   const user = await requireUser(c);
   if (user instanceof Response) return user;
   const appID = c.req.param("appID"), keyID = c.req.param("keyID");
@@ -320,7 +320,7 @@ function deviceDTO(row: DeviceRow) {
   return { id: `${row.installation_id}:${row.environment}`, installationID: row.installation_id, environment: row.environment, platform: row.platform, appVersion: row.app_version, appBuild: row.app_build, locale: row.locale, language: row.language, timeZone: row.time_zone, userID: row.user_id, tags, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at };
 }
 
-app.patch("/v1/apps/:appID/devices/:installationID", async (c) => {
+app.post("/v1/apps/:appID/devices/:installationID/deactivate", async (c) => {
   const user = await requireUser(c);
   if (user instanceof Response) return user;
   const appID = c.req.param("appID"), installationID = c.req.param("installationID"), environment = c.req.query("environment");
@@ -398,7 +398,7 @@ app.get("/v1/apps/:appID/pushes/:jobID", async (c) => {
   return c.json({ push: pushJobDTO(row), deliveries: deliveries.results.map((delivery) => ({ id: delivery.id, deviceID: delivery.device_id, apnsID: delivery.apns_id, status: delivery.status, apnsStatus: delivery.apns_status, reason: delivery.reason, createdAt: delivery.created_at, updatedAt: delivery.updated_at })) });
 });
 
-app.delete("/v1/apps/:appID/pushes/:jobID", async (c) => {
+app.post("/v1/apps/:appID/pushes/:jobID/delete", async (c) => {
   const user = await requireUser(c);
   if (user instanceof Response) return user;
   const appID = c.req.param("appID"), jobID = c.req.param("jobID");
@@ -438,7 +438,7 @@ app.post("/v1/users", async (c) => {
   return c.json({ user: { id, username: parsed.username, role: parsed.role, disabledAt: null, createdAt: now, updatedAt: now } }, 201);
 });
 
-app.patch("/v1/users/:userID", async (c) => {
+app.post("/v1/users/:userID/update", async (c) => {
   const user = await requireUser(c);
   if (user instanceof Response) return user;
   const target = await c.env.SODAPUSH_DB.prepare("SELECT id,username,role,disabled_at,created_at,updated_at FROM users WHERE id=?1 LIMIT 1").bind(c.req.param("userID")).first<UserRow>();
@@ -496,7 +496,7 @@ app.get("/v1/apps/:appID/members", async (c) => {
   return c.json({ members: rows.results.map((row) => ({ id: row.id, userID: row.id, username: row.username, role: row.role, disabledAt: row.disabled_at, createdAt: row.created_at })) });
 });
 
-app.put("/v1/apps/:appID/members/:userID", async (c) => {
+app.post("/v1/apps/:appID/members/:userID", async (c) => {
   const actor = await requireUser(c);
   if (actor instanceof Response) return actor;
   const appID = c.req.param("appID"), userID = c.req.param("userID");
@@ -515,7 +515,7 @@ app.put("/v1/apps/:appID/members/:userID", async (c) => {
   return c.json({ member: { id: target.id, userID: target.id, username: target.username, role: parsed.role, disabledAt: null, createdAt } });
 });
 
-app.delete("/v1/apps/:appID/members/:userID", async (c) => {
+app.post("/v1/apps/:appID/members/:userID/remove", async (c) => {
   const actor = await requireUser(c);
   if (actor instanceof Response) return actor;
   const appID = c.req.param("appID"), userID = c.req.param("userID");
@@ -551,12 +551,12 @@ async function verifySignedRequest(request: Request, env: Env, appID: string, ca
 
 const installationPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-app.put("/v1/apps/:appID/devices/:installationID", async (c) => {
+app.post("/v1/apps/:appID/devices/:installationID/register", async (c) => {
   const rawBody = await c.req.text();
   if (new TextEncoder().encode(rawBody).byteLength > 64 * 1024) return errorResponse(c, 413, "request_too_large", "Request body is too large");
   const appID = c.req.param("appID"), installationID = c.req.param("installationID");
   if (!installationPattern.test(installationID)) return errorResponse(c, 400, "invalid_installation_id", "installationID must be a UUID");
-  const signatureError = await verifySignedRequest(c.req.raw, c.env, appID, `/v1/apps/${appID}/devices/${installationID}`, rawBody);
+  const signatureError = await verifySignedRequest(c.req.raw, c.env, appID, `/v1/apps/${appID}/devices/${installationID}/register`, rawBody);
   if (signatureError) return signatureError;
   let body: DeviceRegistrationRequest;
   try { body = JSON.parse(rawBody) as DeviceRegistrationRequest; } catch { return errorResponse(c, 400, "invalid_json", "Request body must be JSON"); }
@@ -574,13 +574,18 @@ app.put("/v1/apps/:appID/devices/:installationID", async (c) => {
   return c.json({ installationID, environment: body.environment, language: body.context.language ?? null, userID: body.context.userID ?? null, tags, updatedAt: now });
 });
 
-app.delete("/v1/apps/:appID/devices/:installationID", async (c) => {
-  const appID = c.req.param("appID"), installationID = c.req.param("installationID"), environment = c.req.query("environment");
+app.post("/v1/apps/:appID/devices/:installationID/unregister", async (c) => {
+  const appID = c.req.param("appID"), installationID = c.req.param("installationID");
   if (!installationPattern.test(installationID)) return errorResponse(c, 400, "invalid_installation_id", "installationID must be a UUID");
-  if (environment !== "development" && environment !== "production") return errorResponse(c, 400, "invalid_environment", "environment query parameter is required");
-  const canonicalTarget = `/v1/apps/${appID}/devices/${installationID}?environment=${environment}`;
-  const signatureError = await verifySignedRequest(c.req.raw, c.env, appID, canonicalTarget, "");
+  const rawBody = await c.req.text();
+  if (new TextEncoder().encode(rawBody).byteLength > 4096) return errorResponse(c, 413, "request_too_large", "Request body is too large");
+  const canonicalTarget = `/v1/apps/${appID}/devices/${installationID}/unregister`;
+  const signatureError = await verifySignedRequest(c.req.raw, c.env, appID, canonicalTarget, rawBody);
   if (signatureError) return signatureError;
+  let body: unknown;
+  try { body = JSON.parse(rawBody); } catch { return errorResponse(c, 400, "invalid_json", "Request body must be JSON"); }
+  if (!isRecord(body) || !hasOnlyKeys(body, ["environment"]) || !validEnvironment(body.environment)) return errorResponse(c, 400, "invalid_environment", "environment must be development or production");
+  const environment = body.environment;
   await c.env.SODAPUSH_DB.prepare("UPDATE devices SET status='inactive',updated_at=?1 WHERE app_id=?2 AND installation_id=?3 AND environment=?4").bind(new Date().toISOString(), appID, installationID, environment).run();
   return c.body(null, 204);
 });

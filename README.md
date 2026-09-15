@@ -60,6 +60,8 @@ The Docker volume stores SQLite data. Back it up together with `MASTER_KEY`, and
 
 ## Provisioning
 
+We recommend using [SodaPush Admin](https://github.com/SodaPush/AdminClient-Swift) to connect to your deployed server, bootstrap the first owner account, and perform routine API operations such as creating apps, managing APNs keys and devices, and sending pushes. The `curl` examples below are available for automation and troubleshooting.
+
 Bootstrap exactly once:
 
 ```sh

@@ -44,9 +44,28 @@ pnpm run deploy:production
 curl https://<worker-host>/readyz
 ```
 
-The script generates `MASTER_KEY` in an ignored, permission-restricted `.env.production`, prompts for `BOOTSTRAP_TOKEN`, creates or reuses the D1 database and queues, updates the D1 ID in `wrangler.jsonc`, applies remote migrations, and deploys with secrets. Re-running it preserves the original `MASTER_KEY`. Back up the key and database together; never commit the key or a real database ID to a public template branch.
+The script generates `MASTER_KEY` in an ignored, permission-restricted `.env.production`, prompts for `BOOTSTRAP_TOKEN`, creates or reuses the D1 database and queues, updates the D1 ID in `wrangler.jsonc`, applies remote migrations, and deploys with secrets. Re-running it from the same checkout preserves the original `MASTER_KEY`. Back up the key and database together; never commit the key or a real database ID to a public template branch.
 
 Cloudflare also offers a [Deploy to Cloudflare button](https://deploy.workers.cloudflare.com/?url=https://github.com/SodaPush/Server), which can fork the public repository and provision D1/Queues automatically. Configure both required secrets in its setup flow, keep a copy of `MASTER_KEY`, and confirm the detected `deploy` command applies D1 migrations before Worker deployment. The button is a convenient template path; the interactive script handles key generation and existing-resource reuse more explicitly.
+
+## Updating an existing Cloudflare deployment
+
+Update the existing Worker, not a new instance. Before publishing, confirm that `wrangler.jsonc` still names the live Worker, binds `SODAPUSH_DB` to the existing D1 database ID, and uses the existing queue names. The public template intentionally omits `database_id`; deploying a fresh clone without restoring the live binding can provision a new, empty database. Keep the original `MASTER_KEY` unchanged. If `.env.production` is missing, **do not run `deploy:production` as an update**: its first-run setup generates a new key.
+
+For a Worker managed with Wrangler, synchronize the new source into the original deployment checkout while preserving its live `wrangler.jsonc`. The deployment script writes the D1 ID into this tracked file, so a simple `git pull` may stop on local configuration changes; resolve that without discarding the live binding. Back up the live D1 database with [Wrangler's remote export command](https://developers.cloudflare.com/d1/wrangler-commands/#d1-export), storing the export outside the repository. Then run:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm check
+pnpm exec wrangler d1 migrations apply SODAPUSH_DB --remote
+pnpm exec wrangler deploy
+```
+
+Confirm `/readyz` and a normal Admin app operation at the existing Worker URL afterward. Do not bootstrap again: the owner account and device records remain in the same D1 database. A plain `wrangler deploy` keeps [existing Worker secrets](https://developers.cloudflare.com/workers/wrangler/commands/workers/#deploy); it does not generate or replace `MASTER_KEY`. You may reuse `pnpm run deploy:production` only when the original `.env.production` and live resource configuration are still present.
+
+If you used the Deploy to Cloudflare button, update **the forked repository created for your account**, not this upstream template: bring in the upstream changes, preserve its generated Worker/D1/Queue configuration, and push to the production branch connected to Workers Builds. Cloudflare then [builds and deploys on push](https://developers.cloudflare.com/workers/ci-cd/builds/git-integration/). Check that the build's deploy command applies D1 migrations before `wrangler deploy` (this repository's `pnpm run deploy` does both). Do not click the deploy button again to update an existing installation.
+
+If new Worker code fails, [roll back the Worker version](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/) from Wrangler or the dashboard. A Worker rollback does not reverse D1 schema migrations, so check code/schema compatibility before rolling back.
 
 ## Docker or Node.js deployment
 

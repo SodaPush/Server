@@ -52,6 +52,11 @@ Cloudflare also offers a [Deploy to Cloudflare button](https://deploy.workers.cl
 
 ```sh
 cp .env.example .env
+```
+
+Fill in the two blank secrets in `.env` before starting Docker: `MASTER_KEY` must be a random 32-byte base64url value, and `BOOTSTRAP_TOKEN` must be a private token of at least 20 characters. Then start the server:
+
+```sh
 docker compose up --build -d
 curl http://127.0.0.1:8787/readyz
 ```

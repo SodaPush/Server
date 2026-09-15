@@ -7,7 +7,6 @@ services:
       SODAPUSH_DB_URL: file:/app/data/sodapush.db
       MASTER_KEY: ${MASTER_KEY:?set MASTER_KEY}
       BOOTSTRAP_TOKEN: ${BOOTSTRAP_TOKEN:?set BOOTSTRAP_TOKEN}
-      APP_VERSION: ${APP_VERSION:-0.1.0}
     volumes:
       - sodapush-data:/app/data
 

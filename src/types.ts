@@ -2,7 +2,6 @@ export interface Env {
   SODAPUSH_DB: D1Database;
   MASTER_KEY: string;
   BOOTSTRAP_TOKEN?: string;
-  APP_VERSION?: string;
   PUSH_QUEUE?: Queue;
 }
 

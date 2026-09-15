@@ -40,7 +40,6 @@ const env = {
   SODAPUSH_DB: database,
   MASTER_KEY: process.env.MASTER_KEY ?? "",
   BOOTSTRAP_TOKEN: process.env.BOOTSTRAP_TOKEN,
-  APP_VERSION: process.env.APP_VERSION ?? "0.1.0",
 } as unknown as Env;
 
 async function main() {

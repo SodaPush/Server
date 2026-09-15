@@ -1,7 +1,10 @@
 import { readFileSync, writeFileSync } from "node:fs";
+import ts from "typescript";
 
 const configPath = new URL("../wrangler.jsonc", import.meta.url);
-const config = JSON.parse(readFileSync(configPath, "utf8"));
+const parsed = ts.parseConfigFileTextToJson("wrangler.jsonc", readFileSync(configPath, "utf8"));
+if (parsed.error) throw new Error("Could not parse wrangler.jsonc");
+const config = parsed.config;
 const database = config.d1_databases?.find((item) => item.binding === "SODAPUSH_DB");
 if (!database?.database_name) throw new Error("SODAPUSH_DB binding is missing from wrangler.jsonc");
 

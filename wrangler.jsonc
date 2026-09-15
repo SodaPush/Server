@@ -8,13 +8,11 @@
     {
       "binding": "SODAPUSH_DB",
       "database_name": "sodapush-db",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      // database_id is intentionally omitted. The deployment script sets it after creating or finding D1.
+      // Cloudflare's Deploy button can also provision the binding automatically.
       "migrations_dir": "migrations"
     }
   ],
-  "vars": {
-    "APP_VERSION": "0.1.0"
-  },
   "secrets": {
     "required": ["MASTER_KEY", "BOOTSTRAP_TOKEN"]
   },

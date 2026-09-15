@@ -88,7 +88,7 @@ function credentialDTO(row: { id: string; team_id: string; key_id: string; envir
   return { id: row.id, teamID: row.team_id, keyID: row.key_id, environment: row.environment, isDefault: row.is_default === 1, createdAt: row.created_at, updatedAt: row.updated_at };
 }
 
-app.get("/healthz", (c) => c.json({ status: "ok", version: c.env.APP_VERSION ?? "unknown" }));
+app.get("/healthz", (c) => c.json({ status: "ok", version: "0.1.0" }));
 app.get("/readyz", async (c) => {
   try {
     await c.env.SODAPUSH_DB.prepare("SELECT key FROM instance_settings LIMIT 1").first();

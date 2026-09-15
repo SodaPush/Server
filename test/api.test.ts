@@ -56,7 +56,6 @@ describe("API contract", () => {
       SODAPUSH_DB: new TestDatabase(client) as unknown as D1Database,
       MASTER_KEY: Buffer.alloc(32, 7).toString("base64url"),
       BOOTSTRAP_TOKEN: "bootstrap-test-token",
-      APP_VERSION: "test",
     };
   });
 

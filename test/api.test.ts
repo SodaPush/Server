@@ -93,15 +93,14 @@ describe("API contract", () => {
       environment: "production",
       context: { platform: "iOS", language: "en", userID: "customer-42", tags: ["beta", "paid"] },
     });
-    const registration = await signedRequest(path, "PUT", registrationBody, keyID, secret);
+    const registration = await signedRequest(`${path}/register`, "POST", registrationBody, keyID, secret);
     expect(registration.status).toBe(200);
 
     const devices = await request(`/v1/apps/${appID}/devices`, { headers: { Authorization: `Bearer ${accessToken}` } });
     const device = (await devices.json() as { devices: Array<Record<string, unknown>> }).devices[0];
     expect(device).toMatchObject({ id: `${installationID}:production`, installationID, appVersion: null, language: "en", userID: "customer-42", tags: ["beta", "paid"], status: "active" });
 
-    const canonicalTarget = `${path}?environment=production`;
-    const removal = await signedRequest(canonicalTarget, "DELETE", "", keyID, secret);
+    const removal = await signedRequest(`${path}/unregister`, "POST", JSON.stringify({ environment: "production" }), keyID, secret);
     expect(removal.status).toBe(204);
     const row = await client.execute({
       sql: "SELECT status FROM devices WHERE app_id = ? AND installation_id = ? AND environment = ?",
@@ -117,8 +116,8 @@ describe("API contract", () => {
     const apps = await request("/v1/apps", { headers: authorization });
     expect((await apps.json() as { apps: Array<{ role: string }> }).apps[0]?.role).toBe("owner");
 
-    const updated = await request(`/v1/apps/${appID}`, {
-      method: "PATCH",
+    const updated = await request(`/v1/apps/${appID}/update`, {
+      method: "POST",
       headers: { ...authorization, "Content-Type": "application/json" },
       body: JSON.stringify({ name: "Renamed" }),
     });
@@ -185,8 +184,8 @@ describe("API contract", () => {
     });
     expect(createdUser.status).toBe(201);
     const developerID = (await createdUser.json() as { user: { id: string } }).user.id;
-    const editedUser = await request(`/v1/users/${developerID}`, {
-      method: "PATCH",
+    const editedUser = await request(`/v1/users/${developerID}/update`, {
+      method: "POST",
       headers: { ...authorization, "Content-Type": "application/json" },
       body: JSON.stringify({ username: "renamed-developer", password: "updated-secure-password" }),
     });
@@ -201,7 +200,7 @@ describe("API contract", () => {
     const candidates = await request(`/v1/apps/${appID}/member-candidates`, { headers: authorization });
     expect((await candidates.json() as { users: Array<{ id: string }> }).users.map((candidate) => candidate.id)).toContain(developerID);
     const membership = await request(`/v1/apps/${appID}/members/${developerID}`, {
-      method: "PUT",
+      method: "POST",
       headers: { ...authorization, "Content-Type": "application/json" },
       body: JSON.stringify({ role: "developer" }),
     });
@@ -215,34 +214,34 @@ describe("API contract", () => {
     });
     expect(developerLogin.status).toBe(200);
     const developerToken = (await developerLogin.json() as { accessToken: string }).accessToken;
-    const rejectedPasswordChange = await request(`/v1/users/${developerID}`, {
-      method: "PATCH",
+    const rejectedPasswordChange = await request(`/v1/users/${developerID}/update`, {
+      method: "POST",
       headers: { Authorization: `Bearer ${developerToken}`, "Content-Type": "application/json" },
       body: JSON.stringify({ password: "self-service-password", currentPassword: "wrong-password" }),
     });
     expect(rejectedPasswordChange.status).toBe(400);
-    const selfUpdate = await request(`/v1/users/${developerID}`, {
-      method: "PATCH",
+    const selfUpdate = await request(`/v1/users/${developerID}/update`, {
+      method: "POST",
       headers: { Authorization: `Bearer ${developerToken}`, "Content-Type": "application/json" },
       body: JSON.stringify({ username: "self-renamed", password: "self-service-password", currentPassword: "updated-secure-password" }),
     });
     expect(selfUpdate.status).toBe(200);
-    const forbiddenUpdate = await request(`/v1/apps/${appID}`, {
-      method: "PATCH",
+    const forbiddenUpdate = await request(`/v1/apps/${appID}/update`, {
+      method: "POST",
       headers: { Authorization: `Bearer ${developerToken}`, "Content-Type": "application/json" },
       body: JSON.stringify({ name: "Not Allowed" }),
     });
     expect(forbiddenUpdate.status).toBe(403);
 
-    const lastOwner = await request(`/v1/users/${(await client.execute("SELECT id FROM users WHERE role='owner'")).rows[0]?.id}`, {
-      method: "PATCH",
+    const lastOwner = await request(`/v1/users/${(await client.execute("SELECT id FROM users WHERE role='owner'")).rows[0]?.id}/update`, {
+      method: "POST",
       headers: { ...authorization, "Content-Type": "application/json" },
       body: JSON.stringify({ disabled: true }),
     });
     expect(lastOwner.status).toBe(409);
     expect((await lastOwner.json() as { code: string }).code).toBe("owner_immutable");
 
-    const deletedPush = await request(`/v1/apps/${appID}/pushes/job-1`, { method: "DELETE", headers: authorization });
+    const deletedPush = await request(`/v1/apps/${appID}/pushes/job-1/delete`, { method: "POST", headers: authorization });
     expect(deletedPush.status).toBe(204);
     expect((await client.execute({ sql: "SELECT COUNT(*) AS count FROM deliveries WHERE job_id=?", args: ["job-1"] })).rows[0]?.count).toBe(0);
 

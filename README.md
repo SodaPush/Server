@@ -4,6 +4,10 @@ SodaPush Server lets you run your own APNs delivery backend on Cloudflare Worker
 
 This is an APNs integration you deploy yourself, not a hosted push service. Cloudflare hosting does not remove Apple's APNs requirements, and the free plan has usage limits.
 
+> [!WARNING]
+>
+> Please use SodaPush reasonably. SodaPush project are only provided as tools, and SodaPush itself is not a service provider. We are not responsible for the information sent or the behavior of the users.
+
 ## Capabilities
 
 - Encrypted APNs keys, SDK registration secrets, and device tokens

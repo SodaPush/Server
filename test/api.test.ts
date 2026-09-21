@@ -128,10 +128,17 @@ describe("API contract", () => {
       { sql: "INSERT INTO deliveries(id,job_id,device_id,status,apns_status,reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", args: ["delivery-1", "job-1", "device-1", "failed", 410, "Unregistered", "now", "now"] },
     ]);
     const pushes = await request(`/v1/apps/${appID}/pushes`, { headers: authorization });
-    expect((await pushes.json() as { pushes: Array<{ id: string }> }).pushes[0]?.id).toBe("job-1");
+    const pushesBody = await pushes.json() as { pushes: Array<{ id: string; target: { all: boolean }; payload: { aps: { alert: string } } }> };
+    expect(pushesBody.pushes[0]).toMatchObject({
+      id: "job-1",
+      target: { all: true },
+      payload: { aps: { alert: "Hi" } },
+    });
     const push = await request(`/v1/apps/${appID}/pushes/job-1`, { headers: authorization });
-    const pushBody = await push.json() as { push: { failureCount: number }; deliveries: Array<{ reason: string }> };
+    const pushBody = await push.json() as { push: { failureCount: number; target: { all: boolean }; payload: { aps: { alert: string } } }; deliveries: Array<{ reason: string }> };
     expect(pushBody.push.failureCount).toBe(1);
+    expect(pushBody.push.target).toEqual({ all: true });
+    expect(pushBody.push.payload).toEqual({ aps: { alert: "Hi" } });
     expect(pushBody.deliveries[0]?.reason).toBe("Unregistered");
 
     const apns = await request(`/v1/apps/${appID}/apns-credentials`, {
@@ -160,8 +167,12 @@ describe("API contract", () => {
     expect(targetedPush.status).toBe(202);
     const targetedPushID = (await targetedPush.json() as { jobID: string }).jobID;
     const targetedDetail = await request(`/v1/apps/${appID}/pushes/${targetedPushID}`, { headers: authorization });
-    expect((await targetedDetail.json() as { push: { credentialID: string; target: { tags: string[] } } }).push)
-      .toMatchObject({ credentialID: apnsBody.credential.id, target: { tags: ["beta", "paid"] } });
+    expect((await targetedDetail.json() as { push: { credentialID: string; target: { tags: string[] }; payload: { aps: { alert: { title: string; body: string } } } } }).push)
+      .toMatchObject({
+        credentialID: apnsBody.credential.id,
+        target: { tags: ["beta", "paid"] },
+        payload: { aps: { alert: { title: "Hello", body: "World" } } },
+      });
 
     const extraOwner = await request("/v1/users", {
       method: "POST",

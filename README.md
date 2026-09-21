@@ -16,7 +16,7 @@ This is an APNs integration you deploy yourself, not a hosted push service. Clou
 - Device registration with platform metadata, preferred language, tags, and business user ID
 - Audience targeting by all active devices, installation IDs, tags, languages, or user IDs
 - Alert, background, Live Activity, and custom APNs payloads
-- Delivery history, result inspection, and deletion of completed push records
+- Delivery history with immutable audience/payload snapshots, result inspection, and deletion of completed push records
 - One immutable instance owner plus admin/developer/viewer roles and per-app membership
 - Self-service username/password updates plus owner-managed resets, with other sessions revoked after password changes
 
@@ -136,6 +136,10 @@ Use a JSON-aware tool for multiline PEM content.
 ```
 
 Supported targets are `{ "all": true }`, `installationIds`, `tags`, `languages`, or `userIDs`. Multiple values within a selector use OR matching. Only active devices in the selected environment are eligible.
+
+Each push record keeps the exact audience selector and APNs payload submitted for that job. Both `GET /v1/apps/:appID/pushes` and `GET /v1/apps/:appID/pushes/:jobID` return the stored `target` and `payload`, so the Admin app and automation can inspect what was sent later. These are request snapshots; changing a device's tags, language, or user ID afterward does not rewrite existing history.
+
+For GitHub workflow automation, use [SodaPush PushAction](https://github.com/SodaPush/PushAction). It signs in with a Server user, sends through the same API, and can wait for the final delivery status.
 
 ## API summary
 

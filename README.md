@@ -34,6 +34,8 @@ Never commit the two secrets. Losing `MASTER_KEY` makes encrypted records unread
 ## Install and verify
 
 ```sh
+git clone https://github.com/SodaPush/Server
+cd Server
 pnpm install --frozen-lockfile
 pnpm check
 ```
@@ -43,6 +45,8 @@ pnpm check
 For a deployment in your own account, sign in to Wrangler and run the interactive setup:
 
 ```sh
+git clone https://github.com/SodaPush/Server
+cd Server
 pnpm exec wrangler login
 pnpm run deploy:production
 curl https://<worker-host>/readyz
@@ -59,6 +63,8 @@ Update the existing Worker, not a new instance. Before publishing, confirm that 
 For a Worker managed with Wrangler, synchronize the new source into the original deployment checkout while preserving its live `wrangler.jsonc`. The deployment script writes the D1 ID into this tracked file, so a simple `git pull` may stop on local configuration changes; resolve that without discarding the live binding. Back up the live D1 database with [Wrangler's remote export command](https://developers.cloudflare.com/d1/wrangler-commands/#d1-export), storing the export outside the repository. Then run:
 
 ```sh
+git clone https://github.com/SodaPush/Server
+cd Server
 pnpm install --frozen-lockfile
 pnpm check
 pnpm exec wrangler d1 migrations apply SODAPUSH_DB --remote

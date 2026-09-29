@@ -174,6 +174,79 @@ describe("API contract", () => {
         payload: { aps: { alert: { title: "Hello", body: "World" } } },
       });
 
+    const queuedMessages: Array<{ body: unknown; delaySeconds: number | undefined }> = [];
+    env.PUSH_QUEUE = {
+      send: async (body: unknown, options?: { delaySeconds?: number }) => {
+        queuedMessages.push({ body, delaySeconds: options?.delaySeconds });
+      },
+    } as unknown as Queue;
+    const requestedSchedule = new Date(Date.now() + 60_000).toISOString();
+    const scheduledPush = await request(`/v1/apps/${appID}/pushes/schedule`, {
+      method: "POST",
+      headers: { ...authorization, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        environment: "production",
+        pushType: "alert",
+        target: { all: true },
+        payload: { aps: { alert: "Scheduled" } },
+        scheduledAt: requestedSchedule,
+      }),
+    });
+    expect(scheduledPush.status).toBe(202);
+    const scheduledBody = await scheduledPush.json() as { jobID: string; status: string; scheduledAt: string };
+    expect(scheduledBody).toMatchObject({ status: "queued", scheduledAt: requestedSchedule });
+    expect(queuedMessages).toHaveLength(1);
+    expect(queuedMessages[0]?.body).toEqual({ jobID: scheduledBody.jobID });
+    expect(queuedMessages[0]?.delaySeconds).toBeGreaterThanOrEqual(59);
+    expect(queuedMessages[0]?.delaySeconds).toBeLessThanOrEqual(60);
+    const scheduledDetail = await request(`/v1/apps/${appID}/pushes/${scheduledBody.jobID}`, { headers: authorization });
+    expect((await scheduledDetail.json() as { push: { scheduledAt: string } }).push.scheduledAt).toBe(requestedSchedule);
+
+    const scheduleBody = {
+      environment: "production",
+      pushType: "alert",
+      target: { all: true },
+      payload: { aps: { alert: "Scheduled" } },
+    };
+    const missingDate = await request(`/v1/apps/${appID}/pushes/schedule`, {
+      method: "POST",
+      headers: { ...authorization, "Content-Type": "application/json" },
+      body: JSON.stringify(scheduleBody),
+    });
+    expect(missingDate.status).toBe(400);
+    expect(queuedMessages).toHaveLength(1);
+
+    const invalidDate = await request(`/v1/apps/${appID}/pushes/schedule`, {
+      method: "POST",
+      headers: { ...authorization, "Content-Type": "application/json" },
+      body: JSON.stringify({ ...scheduleBody, scheduledAt: "tomorrow" }),
+    });
+    expect(invalidDate.status).toBe(400);
+    expect(queuedMessages).toHaveLength(1);
+
+    env.PUSH_QUEUE = undefined;
+    const unavailableQueue = await request(`/v1/apps/${appID}/pushes/schedule`, {
+      method: "POST",
+      headers: { ...authorization, "Content-Type": "application/json" },
+      body: JSON.stringify({ ...scheduleBody, scheduledAt: requestedSchedule }),
+    });
+    expect(unavailableQueue.status).toBe(503);
+    expect((await unavailableQueue.json() as { code: string }).code).toBe("queue_unavailable");
+
+    const tooFarSchedule = await request(`/v1/apps/${appID}/pushes`, {
+      method: "POST",
+      headers: { ...authorization, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        environment: "production",
+        pushType: "alert",
+        target: { all: true },
+        payload: { aps: { alert: "Too far" } },
+        scheduledAt: new Date(Date.now() + 86_500_000).toISOString(),
+      }),
+    });
+    expect(tooFarSchedule.status).toBe(400);
+    expect((await tooFarSchedule.json() as { code: string }).code).toBe("invalid_schedule");
+
     const extraOwner = await request("/v1/users", {
       method: "POST",
       headers: { ...authorization, "Content-Type": "application/json" },

@@ -16,6 +16,7 @@ This is an APNs integration you deploy yourself, not a hosted push service. Clou
 - Device registration with platform metadata, preferred language, tags, and business user ID
 - Audience targeting by all active devices, installation IDs, tags, languages, or user IDs
 - Alert, background, Live Activity, and custom APNs payloads
+- Queue-backed scheduled delivery up to 24 hours in advance
 - Delivery history with immutable audience/payload snapshots, result inspection, and deletion of completed push records
 - One immutable instance owner plus admin/developer/viewer roles and per-app membership
 - Self-service username/password updates plus owner-managed resets, with other sessions revoked after password changes
@@ -141,6 +142,22 @@ Use a JSON-aware tool for multiline PEM content.
 }
 ```
 
+Use `POST /v1/apps/:appID/pushes/schedule` with an ISO 8601 `scheduledAt` value to defer delivery through Cloudflare Queues:
+
+```json
+{
+  "environment": "production",
+  "pushType": "alert",
+  "target": { "all": true },
+  "payload": { "aps": { "alert": "Scheduled update" } },
+  "scheduledAt": "2026-09-30T02:00:00Z"
+}
+```
+
+Scheduled delivery requires the `PUSH_QUEUE` binding. Cloudflare currently limits per-message Queue delays to 24 hours, so the Server rejects past dates and dates more than 24 hours away. The stored job remains `queued` until its delayed Queue message is consumed. Existing clients can omit `scheduledAt` and continue sending immediately.
+
+To schedule or cancel a notification locally on devices, send an immediate `background` push containing the SodaPush SDK control envelope documented in the [Swift SDK](https://github.com/SodaPush/SDK-Swift#local-notification-scheduling). Background APNs delivery is best-effort and should not be used when the command must arrive reliably or at an exact time.
+
 Supported targets are `{ "all": true }`, `installationIds`, `tags`, `languages`, or `userIDs`. Multiple values within a selector use OR matching. Only active devices in the selected environment are eligible.
 
 Each push record keeps the exact audience selector and APNs payload submitted for that job. Both `GET /v1/apps/:appID/pushes` and `GET /v1/apps/:appID/pushes/:jobID` return the stored `target` and `payload`, so the Admin app and automation can inspect what was sent later. These are request snapshots; changing a device's tags, language, or user ID afterward does not rewrite existing history.
@@ -157,7 +174,7 @@ All HTTP endpoints use only `GET` or `POST`; state changes never use `GET`.
 - APNs credentials: `GET|POST /v1/apps/:appID/apns-credentials`, `POST /v1/apps/:appID/apns-credentials/:credentialID/default|delete`
 - Registration keys: `GET|POST /v1/apps/:appID/registration-keys`, `POST /v1/apps/:appID/registration-keys/:keyID/revoke`
 - Devices: `GET /v1/apps/:appID/devices`, `POST /v1/apps/:appID/devices/:installationID/deactivate`, signed `POST /v1/apps/:appID/devices/:installationID/register|unregister`
-- Pushes: `GET|POST /v1/apps/:appID/pushes`, `GET /v1/apps/:appID/pushes/:jobID`, `POST /v1/apps/:appID/pushes/:jobID/delete`
+- Pushes: `GET|POST /v1/apps/:appID/pushes`, `POST /v1/apps/:appID/pushes/schedule`, `GET /v1/apps/:appID/pushes/:jobID`, `POST /v1/apps/:appID/pushes/:jobID/delete`
 - Users/members: `GET|POST /v1/users`, `POST /v1/users/:userID/update`, `GET /v1/apps/:appID/member-candidates`, `GET /v1/apps/:appID/members`, `POST /v1/apps/:appID/members/:userID` and `/remove`
 
 SDK registration requests use `X-Soda-Key-ID`, `X-Soda-Timestamp`, `X-Soda-Nonce`, and `X-Soda-Signature`. The HMAC-SHA256 input covers method, canonical target, timestamp, nonce, and body hash.

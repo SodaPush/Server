@@ -8,6 +8,7 @@ import type { DeviceRegistrationRequest, Env, ErrorBody, SessionUser } from "./t
 type AppContext = Context<{ Bindings: Env }>;
 type AppRole = "owner" | "admin" | "developer" | "viewer";
 interface PushMessage { jobID: string }
+const maximumQueueDelaySeconds = 86_400;
 
 interface AppRecord {
   id: string;
@@ -337,10 +338,11 @@ app.post("/v1/apps/:appID/devices/:installationID/deactivate", async (c) => {
   return c.json({ device: deviceDTO({ ...existing, status: "inactive", updated_at: updatedAt }) });
 });
 
-app.post("/v1/apps/:appID/pushes", async (c) => {
+async function createPush(c: AppContext, scheduleRequired: boolean): Promise<Response> {
   const user = await requireUser(c);
   if (user instanceof Response) return user;
   const appID = c.req.param("appID");
+  if (!appID) return errorResponse(c, 400, "invalid_app", "App ID is required");
   if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin", "developer"])) return errorResponse(c, 403, "forbidden", "Push permission is required");
   const parsed = await jsonBody(c, 16 * 1024);
   if (parsed instanceof Response) return parsed;
@@ -357,15 +359,30 @@ app.post("/v1/apps/:appID/pushes", async (c) => {
     const credential = await c.env.SODAPUSH_DB.prepare("SELECT id FROM apns_credentials WHERE app_id=?1 AND id=?2 AND environment=?3 LIMIT 1").bind(appID, parsed.credentialID, parsed.environment).first();
     if (!credential) return errorResponse(c, 400, "invalid_credential", "The selected APNs credential does not match this app and environment");
   }
+  let scheduledAt: string | null = null;
+  let delaySeconds = 0;
+  if (parsed.scheduledAt !== undefined && parsed.scheduledAt !== null) {
+    if (!validString(parsed.scheduledAt, 64) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(parsed.scheduledAt)) return errorResponse(c, 400, "invalid_schedule", "scheduledAt must be an ISO 8601 date with a time zone");
+    const scheduledTime = Date.parse(parsed.scheduledAt);
+    if (!Number.isFinite(scheduledTime)) return errorResponse(c, 400, "invalid_schedule", "scheduledAt must be a valid ISO 8601 date");
+    delaySeconds = Math.ceil((scheduledTime - Date.now()) / 1000);
+    if (delaySeconds <= 0 || delaySeconds > maximumQueueDelaySeconds) return errorResponse(c, 400, "invalid_schedule", "scheduledAt must be in the future and no more than 24 hours away");
+    if (!c.env.PUSH_QUEUE) return errorResponse(c, 503, "queue_unavailable", "Scheduled delivery requires a configured push queue");
+    scheduledAt = new Date(scheduledTime).toISOString();
+  }
+  if (scheduleRequired && scheduledAt === null) return errorResponse(c, 400, "invalid_schedule", "scheduledAt is required for scheduled delivery");
   const target = parsed.target.all === true ? { all: true } : validInstallations ? { installationIds: validInstallations } : tags ? { tags } : languages ? { languages } : { userIDs };
-  const requestJSON = JSON.stringify({ environment: parsed.environment, credentialID: parsed.credentialID ?? null, pushType: parsed.pushType ?? "alert", target, payload: parsed.payload });
+  const requestJSON = JSON.stringify({ environment: parsed.environment, credentialID: parsed.credentialID ?? null, pushType: parsed.pushType ?? "alert", target, payload: parsed.payload, scheduledAt });
   const jobID = crypto.randomUUID();
   const now = new Date().toISOString();
   await c.env.SODAPUSH_DB.prepare("INSERT INTO push_jobs (id,app_id,environment,request_json,status,created_by,created_at,updated_at) VALUES (?1,?2,?3,?4,'queued',?5,?6,?6)").bind(jobID, appID, parsed.environment, requestJSON, user.id, now).run();
-  if (c.env.PUSH_QUEUE) await c.env.PUSH_QUEUE.send({ jobID }); else await processPushJob(c.env, jobID);
+  if (c.env.PUSH_QUEUE) await c.env.PUSH_QUEUE.send({ jobID }, { delaySeconds }); else await processPushJob(c.env, jobID);
   const state = await c.env.SODAPUSH_DB.prepare("SELECT status FROM push_jobs WHERE id=?1").bind(jobID).first<{ status: string }>();
-  return c.json({ jobID, status: state?.status ?? "queued" }, 202);
-});
+  return c.json({ jobID, status: state?.status ?? "queued", scheduledAt }, 202);
+}
+
+app.post("/v1/apps/:appID/pushes", (c) => createPush(c, false));
+app.post("/v1/apps/:appID/pushes/schedule", (c) => createPush(c, true));
 
 interface PushJobRow {
   id: string; app_id: string; environment: string; request_json: string; status: string;
@@ -375,7 +392,7 @@ interface PushJobRow {
 
 function pushJobDTO(row: PushJobRow) {
   const request = parsedPushRequest(row.request_json);
-  return { id: row.id, appID: row.app_id, environment: row.environment, credentialID: request?.credentialID ?? null, pushType: request?.pushType ?? null, target: request?.target ?? null, payload: request?.payload ?? null, status: row.status, totalCount: row.total_count, successCount: row.success_count, failureCount: row.failure_count, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at };
+  return { id: row.id, appID: row.app_id, environment: row.environment, credentialID: request?.credentialID ?? null, pushType: request?.pushType ?? null, target: request?.target ?? null, payload: request?.payload ?? null, scheduledAt: request?.scheduledAt ?? null, status: row.status, totalCount: row.total_count, successCount: row.success_count, failureCount: row.failure_count, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at };
 }
 
 app.get("/v1/apps/:appID/pushes", async (c) => {
@@ -593,7 +610,8 @@ app.post("/v1/apps/:appID/devices/:installationID/unregister", async (c) => {
 export async function processPushJob(env: Env, jobID: string): Promise<void> {
   const job = await env.SODAPUSH_DB.prepare("SELECT id,app_id,environment,request_json,status FROM push_jobs WHERE id=?1 LIMIT 1").bind(jobID).first<{ id: string; app_id: string; environment: "development" | "production"; request_json: string; status: string }>();
   if (!job || job.status !== "queued") return;
-  await env.SODAPUSH_DB.prepare("UPDATE push_jobs SET status='running',updated_at=?1 WHERE id=?2 AND status='queued'").bind(new Date().toISOString(), jobID).run();
+  const claim = await env.SODAPUSH_DB.prepare("UPDATE push_jobs SET status='running',updated_at=?1 WHERE id=?2 AND status='queued'").bind(new Date().toISOString(), jobID).run();
+  if ((claim as { meta?: { changes?: number } }).meta?.changes === 0) return;
   try {
     const appRecord = await env.SODAPUSH_DB.prepare("SELECT bundle_id FROM apps WHERE id=?1 AND disabled_at IS NULL LIMIT 1").bind(job.app_id).first<{ bundle_id: string }>();
     const request = JSON.parse(job.request_json) as { credentialID?: string | null; pushType: "alert" | "background" | "liveactivity"; target: { all?: boolean; installationIds?: string[]; tags?: string[]; languages?: string[]; userIDs?: string[] }; payload: Record<string, unknown> };

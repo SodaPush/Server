@@ -36,8 +36,7 @@ Never commit the two secrets. Losing `MASTER_KEY` makes encrypted records unread
 ## Install and verify
 
 ```sh
-git clone https://github.com/SodaPush/Server
-cd Server
+cd /path/to/your/existing/Server
 pnpm install --frozen-lockfile
 pnpm check
 ```
@@ -74,6 +73,8 @@ pnpm exec wrangler deploy
 ```
 
 Confirm `/readyz` and a normal Admin app operation at the existing Worker URL afterward. Do not bootstrap again: the owner account and device records remain in the same D1 database. A plain `wrangler deploy` keeps [existing Worker secrets](https://developers.cloudflare.com/workers/wrangler/commands/workers/#deploy); it does not generate or replace `MASTER_KEY`. You may reuse `pnpm run deploy:production` only when the original `.env.production` and live resource configuration are still present.
+
+If push history starts returning HTTP 500 after a code-only upgrade, check whether migration `0005_push_recall.sql` was applied to the **same remote D1 database bound to the Worker**. The Server keeps history reads compatible with the preceding schema, but new recall and push processing still require this migration. From the deployment checkout with its live `wrangler.jsonc`, run `pnpm exec wrangler d1 migrations apply SODAPUSH_DB --remote` before deploying the updated Worker.
 
 If you used the Deploy to Cloudflare button, update **the forked repository created for your account**, not this upstream template: bring in the upstream changes, preserve its generated Worker/D1/Queue configuration, and push to the production branch connected to Workers Builds. Cloudflare then [builds and deploys on push](https://developers.cloudflare.com/workers/ci-cd/builds/git-integration/). Check that the build's deploy command applies D1 migrations before `wrangler deploy` (this repository's `pnpm run deploy` does both). Do not click the deploy button again to update an existing installation.
 

@@ -393,12 +393,12 @@ interface PushJobRow {
   id: string; app_id: string; environment: string; request_json: string; status: string;
   total_count: number; success_count: number; failure_count: number; created_by: string | null;
   created_at: string; updated_at: string; local_cancelled_at: string | null; local_cancellation_job_id: string | null;
-  recalled_at: string | null; recall_job_id: string | null;
+  recalled_at?: string | null; recall_job_id?: string | null;
 }
 
 function pushJobDTO(row: PushJobRow) {
   const request = parsedPushRequest(row.request_json);
-  return { id: row.id, appID: row.app_id, environment: row.environment, credentialID: request?.credentialID ?? null, pushType: request?.pushType ?? null, target: request?.target ?? null, payload: request?.payload ?? null, scheduledAt: request?.scheduledAt ?? null, cancellationOf: request?.cancellationOf ?? null, recallOf: request?.recallOf ?? null, recallIdentifier: request?.recallIdentifier ?? null, localCancelledAt: row.local_cancelled_at, localCancellationJobID: row.local_cancellation_job_id, recalledAt: row.recalled_at, recallJobID: row.recall_job_id, status: row.recalled_at ? "recalled" : row.local_cancelled_at ? "cancelled" : row.status, totalCount: row.total_count, successCount: row.success_count, failureCount: row.failure_count, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at };
+  return { id: row.id, appID: row.app_id, environment: row.environment, credentialID: request?.credentialID ?? null, pushType: request?.pushType ?? null, target: request?.target ?? null, payload: request?.payload ?? null, scheduledAt: request?.scheduledAt ?? null, cancellationOf: request?.cancellationOf ?? null, recallOf: request?.recallOf ?? null, recallIdentifier: request?.recallIdentifier ?? null, localCancelledAt: row.local_cancelled_at, localCancellationJobID: row.local_cancellation_job_id, recalledAt: row.recalled_at ?? null, recallJobID: row.recall_job_id ?? null, status: row.recalled_at ? "recalled" : row.local_cancelled_at ? "cancelled" : row.status, totalCount: row.total_count, successCount: row.success_count, failureCount: row.failure_count, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at };
 }
 
 app.get("/v1/apps/:appID/pushes", async (c) => {
@@ -406,7 +406,7 @@ app.get("/v1/apps/:appID/pushes", async (c) => {
   if (user instanceof Response) return user;
   const appID = c.req.param("appID");
   if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin", "developer", "viewer"])) return errorResponse(c, 403, "forbidden", "App access is required");
-  const rows = await c.env.SODAPUSH_DB.prepare("SELECT id,app_id,environment,request_json,status,total_count,success_count,failure_count,created_by,created_at,updated_at,local_cancelled_at,local_cancellation_job_id,recalled_at,recall_job_id FROM push_jobs WHERE app_id=?1 ORDER BY created_at DESC LIMIT 100").bind(appID).all<PushJobRow>();
+  const rows = await c.env.SODAPUSH_DB.prepare("SELECT * FROM push_jobs WHERE app_id=?1 ORDER BY created_at DESC LIMIT 100").bind(appID).all<PushJobRow>();
   return c.json({ pushes: rows.results.map(pushJobDTO) });
 });
 
@@ -415,7 +415,7 @@ app.get("/v1/apps/:appID/pushes/:jobID", async (c) => {
   if (user instanceof Response) return user;
   const appID = c.req.param("appID");
   if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin", "developer", "viewer"])) return errorResponse(c, 403, "forbidden", "App access is required");
-  const row = await c.env.SODAPUSH_DB.prepare("SELECT id,app_id,environment,request_json,status,total_count,success_count,failure_count,created_by,created_at,updated_at,local_cancelled_at,local_cancellation_job_id,recalled_at,recall_job_id FROM push_jobs WHERE app_id=?1 AND id=?2 LIMIT 1").bind(appID, c.req.param("jobID")).first<PushJobRow>();
+  const row = await c.env.SODAPUSH_DB.prepare("SELECT * FROM push_jobs WHERE app_id=?1 AND id=?2 LIMIT 1").bind(appID, c.req.param("jobID")).first<PushJobRow>();
   if (!row) return errorResponse(c, 404, "push_not_found", "Push job was not found");
   const deliveries = await c.env.SODAPUSH_DB.prepare("SELECT id,device_id,apns_id,status,apns_status,reason,created_at,updated_at FROM deliveries WHERE job_id=?1 ORDER BY created_at ASC").bind(row.id).all<{ id: string; device_id: string | null; apns_id: string | null; status: string; apns_status: number | null; reason: string | null; created_at: string; updated_at: string }>();
   return c.json({ push: pushJobDTO(row), deliveries: deliveries.results.map((delivery) => ({ id: delivery.id, deviceID: delivery.device_id, apnsID: delivery.apns_id, status: delivery.status, apnsStatus: delivery.apns_status, reason: delivery.reason, createdAt: delivery.created_at, updatedAt: delivery.updated_at })) });

@@ -206,6 +206,23 @@ describe("API contract", () => {
     expect((await client.execute("SELECT recalled_at FROM push_jobs WHERE id='legacy-alert'")).rows[0]?.recalled_at).toBeNull();
   });
 
+  it("keeps push history readable before the recall migration is applied", async () => {
+    const { appID, accessToken } = await createApplication();
+    await client.execute("ALTER TABLE push_jobs DROP COLUMN recalled_at");
+    await client.execute("ALTER TABLE push_jobs DROP COLUMN recall_job_id");
+    await client.execute({
+      sql: "INSERT INTO push_jobs(id,app_id,environment,request_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+      args: ["pre-migration-alert", appID, "production", JSON.stringify({ pushType: "alert", target: { all: true }, payload: { aps: { alert: "Old" } } }), "completed", "now", "now"],
+    });
+    const authorization = { Authorization: `Bearer ${accessToken}` };
+    const list = await request(`/v1/apps/${appID}/pushes`, { headers: authorization });
+    expect(list.status).toBe(200);
+    expect((await list.json() as { pushes: Array<{ id: string; recalledAt: string | null }> }).pushes).toMatchObject([{ id: "pre-migration-alert", recalledAt: null }]);
+    const detail = await request(`/v1/apps/${appID}/pushes/pre-migration-alert`, { headers: authorization });
+    expect(detail.status).toBe(200);
+    expect((await detail.json() as { push: { id: string; recallJobID: string | null } }).push).toMatchObject({ id: "pre-migration-alert", recallJobID: null });
+  });
+
   it("supports the practical management lifecycle without exposing stored secrets", async () => {
     const { appID, accessToken } = await createApplication();
     const authorization = { Authorization: `Bearer ${accessToken}` };

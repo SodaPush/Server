@@ -387,12 +387,12 @@ app.post("/v1/apps/:appID/pushes/schedule", (c) => createPush(c, true));
 interface PushJobRow {
   id: string; app_id: string; environment: string; request_json: string; status: string;
   total_count: number; success_count: number; failure_count: number; created_by: string | null;
-  created_at: string; updated_at: string;
+  created_at: string; updated_at: string; local_cancelled_at: string | null; local_cancellation_job_id: string | null;
 }
 
 function pushJobDTO(row: PushJobRow) {
   const request = parsedPushRequest(row.request_json);
-  return { id: row.id, appID: row.app_id, environment: row.environment, credentialID: request?.credentialID ?? null, pushType: request?.pushType ?? null, target: request?.target ?? null, payload: request?.payload ?? null, scheduledAt: request?.scheduledAt ?? null, status: row.status, totalCount: row.total_count, successCount: row.success_count, failureCount: row.failure_count, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at };
+  return { id: row.id, appID: row.app_id, environment: row.environment, credentialID: request?.credentialID ?? null, pushType: request?.pushType ?? null, target: request?.target ?? null, payload: request?.payload ?? null, scheduledAt: request?.scheduledAt ?? null, cancellationOf: request?.cancellationOf ?? null, localCancelledAt: row.local_cancelled_at, localCancellationJobID: row.local_cancellation_job_id, status: row.local_cancelled_at ? "cancelled" : row.status, totalCount: row.total_count, successCount: row.success_count, failureCount: row.failure_count, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at };
 }
 
 app.get("/v1/apps/:appID/pushes", async (c) => {
@@ -400,7 +400,7 @@ app.get("/v1/apps/:appID/pushes", async (c) => {
   if (user instanceof Response) return user;
   const appID = c.req.param("appID");
   if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin", "developer", "viewer"])) return errorResponse(c, 403, "forbidden", "App access is required");
-  const rows = await c.env.SODAPUSH_DB.prepare("SELECT id,app_id,environment,request_json,status,total_count,success_count,failure_count,created_by,created_at,updated_at FROM push_jobs WHERE app_id=?1 ORDER BY created_at DESC LIMIT 100").bind(appID).all<PushJobRow>();
+  const rows = await c.env.SODAPUSH_DB.prepare("SELECT id,app_id,environment,request_json,status,total_count,success_count,failure_count,created_by,created_at,updated_at,local_cancelled_at,local_cancellation_job_id FROM push_jobs WHERE app_id=?1 ORDER BY created_at DESC LIMIT 100").bind(appID).all<PushJobRow>();
   return c.json({ pushes: rows.results.map(pushJobDTO) });
 });
 
@@ -409,10 +409,47 @@ app.get("/v1/apps/:appID/pushes/:jobID", async (c) => {
   if (user instanceof Response) return user;
   const appID = c.req.param("appID");
   if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin", "developer", "viewer"])) return errorResponse(c, 403, "forbidden", "App access is required");
-  const row = await c.env.SODAPUSH_DB.prepare("SELECT id,app_id,environment,request_json,status,total_count,success_count,failure_count,created_by,created_at,updated_at FROM push_jobs WHERE app_id=?1 AND id=?2 LIMIT 1").bind(appID, c.req.param("jobID")).first<PushJobRow>();
+  const row = await c.env.SODAPUSH_DB.prepare("SELECT id,app_id,environment,request_json,status,total_count,success_count,failure_count,created_by,created_at,updated_at,local_cancelled_at,local_cancellation_job_id FROM push_jobs WHERE app_id=?1 AND id=?2 LIMIT 1").bind(appID, c.req.param("jobID")).first<PushJobRow>();
   if (!row) return errorResponse(c, 404, "push_not_found", "Push job was not found");
   const deliveries = await c.env.SODAPUSH_DB.prepare("SELECT id,device_id,apns_id,status,apns_status,reason,created_at,updated_at FROM deliveries WHERE job_id=?1 ORDER BY created_at ASC").bind(row.id).all<{ id: string; device_id: string | null; apns_id: string | null; status: string; apns_status: number | null; reason: string | null; created_at: string; updated_at: string }>();
   return c.json({ push: pushJobDTO(row), deliveries: deliveries.results.map((delivery) => ({ id: delivery.id, deviceID: delivery.device_id, apnsID: delivery.apns_id, status: delivery.status, apnsStatus: delivery.apns_status, reason: delivery.reason, createdAt: delivery.created_at, updatedAt: delivery.updated_at })) });
+});
+
+app.post("/v1/apps/:appID/pushes/:jobID/cancel-local", async (c) => {
+  const user = await requireUser(c);
+  if (user instanceof Response) return user;
+  const appID = c.req.param("appID"), jobID = c.req.param("jobID");
+  if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin", "developer"])) return errorResponse(c, 403, "forbidden", "Push permission is required");
+  if (!c.env.PUSH_QUEUE) return errorResponse(c, 503, "queue_unavailable", "Local cancellation requires a configured push queue");
+  const original = await c.env.SODAPUSH_DB.prepare("SELECT id,environment,request_json,status,success_count,local_cancelled_at FROM push_jobs WHERE app_id=?1 AND id=?2 LIMIT 1").bind(appID, jobID).first<{ id: string; environment: PushEnvironment; request_json: string; status: string; success_count: number; local_cancelled_at: string | null }>();
+  if (!original) return errorResponse(c, 404, "push_not_found", "Push job was not found");
+  const request = parsedPushRequest(original.request_json);
+  const payload = request?.payload;
+  const namespace = isRecord(payload) ? payload.sodapush : null;
+  const command = isRecord(namespace) ? namespace.localNotification : null;
+  if (request?.pushType !== "background" || !isRecord(request.target) || !isRecord(namespace) || namespace.version !== 1 || !isRecord(command) || command.action !== "schedule" || !validString(command.identifier, 128) || !validString(command.fireAt, 64)) return errorResponse(c, 409, "not_local_schedule", "This push is not a local scheduling command");
+  if (original.local_cancelled_at) return errorResponse(c, 409, "already_cancelled", "A cancellation command was already queued");
+  const fireTime = Date.parse(command.fireAt);
+  if (!Number.isFinite(fireTime) || fireTime <= Date.now()) return errorResponse(c, 409, "schedule_elapsed", "The local notification display time has passed");
+  if (!["completed", "partial"].includes(original.status) || original.success_count < 1) return errorResponse(c, 409, "schedule_not_sent", "The original scheduling command has not reached APNs");
+
+  const cancellationJobID = crypto.randomUUID(), now = new Date().toISOString();
+  const claimed = await c.env.SODAPUSH_DB.prepare("UPDATE push_jobs SET local_cancelled_at=?1,local_cancellation_job_id=?2,updated_at=?1 WHERE app_id=?3 AND id=?4 AND local_cancelled_at IS NULL AND status IN ('completed','partial') AND success_count>0").bind(now, cancellationJobID, appID, jobID).run();
+  const changeCount = (claimed as { meta?: { changes?: number }; rowsAffected?: number }).meta?.changes ?? (claimed as { rowsAffected?: number }).rowsAffected;
+  if (changeCount === 0) return errorResponse(c, 409, "already_cancelled", "A cancellation command was already queued");
+
+  const cancellationRequest = JSON.stringify({ environment: original.environment, credentialID: request.credentialID ?? null, pushType: "background", target: request.target, cancellationOf: jobID, payload: { aps: { "content-available": 1 }, sodapush: { version: 1, localNotification: { action: "cancel", identifier: command.identifier } } } });
+  try {
+    await c.env.SODAPUSH_DB.prepare("INSERT INTO push_jobs (id,app_id,environment,request_json,status,created_by,created_at,updated_at) VALUES (?1,?2,?3,?4,'queued',?5,?6,?6)").bind(cancellationJobID, appID, original.environment, cancellationRequest, user.id, now).run();
+    await c.env.PUSH_QUEUE.send({ jobID: cancellationJobID });
+  } catch (error) {
+    await c.env.SODAPUSH_DB.batch([
+      c.env.SODAPUSH_DB.prepare("UPDATE push_jobs SET local_cancelled_at=NULL,local_cancellation_job_id=NULL,updated_at=?1 WHERE app_id=?2 AND id=?3 AND local_cancellation_job_id=?4").bind(new Date().toISOString(), appID, jobID, cancellationJobID),
+      c.env.SODAPUSH_DB.prepare("DELETE FROM push_jobs WHERE app_id=?1 AND id=?2 AND status='queued'").bind(appID, cancellationJobID),
+    ]);
+    throw error;
+  }
+  return c.json({ jobID: cancellationJobID, status: "queued", originalJobID: jobID, localCancelledAt: now }, 202);
 });
 
 app.post("/v1/apps/:appID/pushes/:jobID/delete", async (c) => {
@@ -420,9 +457,13 @@ app.post("/v1/apps/:appID/pushes/:jobID/delete", async (c) => {
   if (user instanceof Response) return user;
   const appID = c.req.param("appID"), jobID = c.req.param("jobID");
   if (!hasRole(await appRole(c.env, user, appID), ["owner", "admin", "developer"])) return errorResponse(c, 403, "forbidden", "Push deletion permission is required");
-  const job = await c.env.SODAPUSH_DB.prepare("SELECT status FROM push_jobs WHERE app_id=?1 AND id=?2 LIMIT 1").bind(appID, jobID).first<{ status: string }>();
+  const job = await c.env.SODAPUSH_DB.prepare("SELECT status,local_cancellation_job_id FROM push_jobs WHERE app_id=?1 AND id=?2 LIMIT 1").bind(appID, jobID).first<{ status: string; local_cancellation_job_id: string | null }>();
   if (!job) return errorResponse(c, 404, "push_not_found", "Push job was not found");
   if (job.status === "queued" || job.status === "running") return errorResponse(c, 409, "push_in_progress", "A queued or running push cannot be deleted");
+  if (job.local_cancellation_job_id) {
+    const cancellation = await c.env.SODAPUSH_DB.prepare("SELECT status FROM push_jobs WHERE app_id=?1 AND id=?2 LIMIT 1").bind(appID, job.local_cancellation_job_id).first<{ status: string }>();
+    if (cancellation?.status === "queued" || cancellation?.status === "running") return errorResponse(c, 409, "push_in_progress", "Wait until the cancellation command finishes before deleting its original record");
+  }
   await c.env.SODAPUSH_DB.batch([
     c.env.SODAPUSH_DB.prepare("DELETE FROM deliveries WHERE job_id=?1").bind(jobID),
     c.env.SODAPUSH_DB.prepare("DELETE FROM push_jobs WHERE app_id=?1 AND id=?2").bind(appID, jobID),
@@ -614,13 +655,20 @@ export async function processPushJob(env: Env, jobID: string): Promise<void> {
   if ((claim as { meta?: { changes?: number } }).meta?.changes === 0) return;
   try {
     const appRecord = await env.SODAPUSH_DB.prepare("SELECT bundle_id FROM apps WHERE id=?1 AND disabled_at IS NULL LIMIT 1").bind(job.app_id).first<{ bundle_id: string }>();
-    const request = JSON.parse(job.request_json) as { credentialID?: string | null; pushType: "alert" | "background" | "liveactivity"; target: { all?: boolean; installationIds?: string[]; tags?: string[]; languages?: string[]; userIDs?: string[] }; payload: Record<string, unknown> };
-    const stored = request.credentialID
+    const request = JSON.parse(job.request_json) as { credentialID?: string | null; cancellationOf?: string; pushType: "alert" | "background" | "liveactivity"; target: { all?: boolean; installationIds?: string[]; tags?: string[]; languages?: string[]; userIDs?: string[] }; payload: Record<string, unknown> };
+    let stored = request.credentialID
       ? await env.SODAPUSH_DB.prepare("SELECT team_id,key_id,p8_ciphertext,p8_nonce FROM apns_credentials WHERE app_id=?1 AND id=?2 AND environment=?3 LIMIT 1").bind(job.app_id, request.credentialID, job.environment).first<{ team_id: string; key_id: string; p8_ciphertext: string; p8_nonce: string }>()
       : await env.SODAPUSH_DB.prepare("SELECT team_id,key_id,p8_ciphertext,p8_nonce FROM apns_credentials WHERE app_id=?1 AND environment=?2 ORDER BY is_default DESC,updated_at DESC LIMIT 1").bind(job.app_id, job.environment).first<{ team_id: string; key_id: string; p8_ciphertext: string; p8_nonce: string }>();
+    if (!stored && request.cancellationOf) {
+      stored = await env.SODAPUSH_DB.prepare("SELECT team_id,key_id,p8_ciphertext,p8_nonce FROM apns_credentials WHERE app_id=?1 AND environment=?2 ORDER BY is_default DESC,updated_at DESC LIMIT 1").bind(job.app_id, job.environment).first<{ team_id: string; key_id: string; p8_ciphertext: string; p8_nonce: string }>();
+    }
     if (!appRecord || !stored) { await env.SODAPUSH_DB.prepare("UPDATE push_jobs SET status='failed',failure_count=failure_count+1,updated_at=?1 WHERE id=?2").bind(new Date().toISOString(), jobID).run(); return; }
     const devices = await env.SODAPUSH_DB.prepare("SELECT installation_id,device_token_ciphertext,device_token_nonce,language,user_id,tags_json FROM devices WHERE app_id=?1 AND environment=?2 AND status='active'").bind(job.app_id, job.environment).all<{ installation_id: string; device_token_ciphertext: string; device_token_nonce: string; language: string | null; user_id: string | null; tags_json: string }>();
+    const originalRecipients = request.cancellationOf
+      ? new Set((await env.SODAPUSH_DB.prepare("SELECT device_id FROM deliveries WHERE job_id=?1 AND status='sent'").bind(request.cancellationOf).all<{ device_id: string }>()).results.map((delivery) => delivery.device_id))
+      : null;
     const selected = devices.results.filter((device) => {
+      if (originalRecipients) return originalRecipients.has(device.installation_id);
       if (request.target.all === true) return true;
       if (request.target.installationIds) return request.target.installationIds.includes(device.installation_id);
       if (request.target.languages) return device.language !== null && request.target.languages.includes(device.language);

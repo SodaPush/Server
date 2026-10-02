@@ -51,7 +51,8 @@ describe("API contract", () => {
     const initial = await readFile(new URL("../migrations/0001_initial.sql", import.meta.url), "utf8");
     const accounts = await readFile(new URL("../migrations/0002_accounts_pushes.sql", import.meta.url), "utf8");
     const targeting = await readFile(new URL("../migrations/0003_targeting_and_credentials.sql", import.meta.url), "utf8");
-    await client.executeMultiple(`${initial}\n${accounts}\n${targeting}`);
+    const cancellation = await readFile(new URL("../migrations/0004_local_cancellation.sql", import.meta.url), "utf8");
+    await client.executeMultiple(`${initial}\n${accounts}\n${targeting}\n${cancellation}`);
     env = {
       SODAPUSH_DB: new TestDatabase(client) as unknown as D1Database,
       MASTER_KEY: Buffer.alloc(32, 7).toString("base64url"),
@@ -106,6 +107,48 @@ describe("API contract", () => {
       args: [appID, installationID, "production"],
     });
     expect(row.rows[0]?.status).toBe("inactive");
+  });
+
+  it("cancels a local schedule from its original push record", async () => {
+    const { appID, accessToken } = await createApplication();
+    const authorization = { Authorization: `Bearer ${accessToken}` };
+    const fireAt = new Date(Date.now() + 3_600_000).toISOString();
+    const originalRequest = {
+      environment: "production",
+      pushType: "background",
+      target: { tags: ["launch"] },
+      payload: { aps: { "content-available": 1 }, sodapush: { version: 1, localNotification: { action: "schedule", identifier: "launch-reminder", fireAt, body: "Launch" } } },
+    };
+    await client.execute({ sql: "INSERT INTO push_jobs(id,app_id,environment,request_json,status,total_count,success_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", args: ["original-local", appID, "production", JSON.stringify(originalRequest), "completed", 2, 1, "now", "now"] });
+    await client.execute({ sql: "INSERT INTO deliveries(id,job_id,device_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?)", args: ["original-delivery", "original-local", "device-1", "sent", "now", "now"] });
+    const queued: unknown[] = [];
+    env.PUSH_QUEUE = { send: async (body: unknown) => { queued.push(body); } } as unknown as Queue;
+
+    const cancelled = await request(`/v1/apps/${appID}/pushes/original-local/cancel-local`, { method: "POST", headers: authorization });
+    expect(cancelled.status).toBe(202);
+    const cancellation = await cancelled.json() as { jobID: string; originalJobID: string };
+    expect(cancellation.originalJobID).toBe("original-local");
+    expect(queued).toEqual([{ jobID: cancellation.jobID }]);
+    const original = await request(`/v1/apps/${appID}/pushes/original-local`, { headers: authorization });
+    expect((await original.json() as { push: { status: string; localCancellationJobID: string } }).push).toMatchObject({ status: "cancelled", localCancellationJobID: cancellation.jobID });
+    const created = await client.execute({ sql: "SELECT request_json FROM push_jobs WHERE id=?", args: [cancellation.jobID] });
+    const createdRequest = JSON.parse(String(created.rows[0]?.request_json)) as { cancellationOf: string; target: { tags: string[] }; payload: { sodapush: { localNotification: { action: string; identifier: string } } } };
+    expect(createdRequest).toMatchObject({ cancellationOf: "original-local", target: { tags: ["launch"] }, payload: { sodapush: { localNotification: { action: "cancel", identifier: "launch-reminder" } } } });
+    expect((await request(`/v1/apps/${appID}/pushes/original-local/cancel-local`, { method: "POST", headers: authorization })).status).toBe(409);
+    expect((await request(`/v1/apps/${appID}/pushes/original-local/delete`, { method: "POST", headers: authorization })).status).toBe(409);
+    expect(queued).toHaveLength(1);
+
+    await client.execute({ sql: "INSERT INTO push_jobs(id,app_id,environment,request_json,status,total_count,success_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", args: ["another-local", appID, "production", JSON.stringify(originalRequest), "completed", 1, 1, "now", "now"] });
+    env.PUSH_QUEUE = undefined;
+    const unavailable = await request(`/v1/apps/${appID}/pushes/another-local/cancel-local`, { method: "POST", headers: authorization });
+    expect(unavailable.status).toBe(503);
+    expect((await client.execute("SELECT local_cancelled_at FROM push_jobs WHERE id='another-local'")).rows[0]?.local_cancelled_at).toBeNull();
+
+    env.PUSH_QUEUE = { send: async () => { throw new Error("Queue unavailable"); } } as unknown as Queue;
+    const enqueueFailure = await request(`/v1/apps/${appID}/pushes/another-local/cancel-local`, { method: "POST", headers: authorization });
+    expect(enqueueFailure.status).toBe(500);
+    expect((await client.execute("SELECT local_cancelled_at FROM push_jobs WHERE id='another-local'")).rows[0]?.local_cancelled_at).toBeNull();
+    expect((await client.execute({ sql: "SELECT COUNT(*) AS count FROM push_jobs WHERE app_id=?", args: [appID] })).rows[0]?.count).toBe(3);
   });
 
   it("supports the practical management lifecycle without exposing stored secrets", async () => {

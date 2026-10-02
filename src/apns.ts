@@ -60,7 +60,8 @@ export async function sendToAPNs(
   bundleID: string,
   deviceToken: string,
   payload: string,
-  pushType: "alert" | "background" | "liveactivity" = "alert"
+  pushType: "alert" | "background" | "liveactivity" = "alert",
+  collapseID?: string
 ): Promise<{ status: number; apnsID: string | null; reason: string | null }> {
   const p8 = await decryptSecret(env.MASTER_KEY, credential.p8Ciphertext, credential.p8Nonce);
   const token = await providerToken(credential.teamID, credential.keyID, p8);
@@ -73,6 +74,7 @@ export async function sendToAPNs(
       "apns-topic": topic,
       "apns-push-type": pushType,
       "apns-priority": pushType === "background" ? "5" : "10",
+      ...(collapseID ? { "apns-collapse-id": collapseID } : {}),
       "content-type": "application/json",
     },
     body: payload,

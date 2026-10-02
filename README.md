@@ -17,6 +17,7 @@ This is an APNs integration you deploy yourself, not a hosted push service. Clou
 - Audience targeting by all active devices, installation IDs, tags, languages, or user IDs
 - Alert, background, Live Activity, and custom APNs payloads
 - Queue-backed scheduled delivery up to 24 hours in advance
+- Best-effort alert recall: stop queued jobs or request removal of a displayed notification
 - Delivery history with immutable audience/payload snapshots, result inspection, and deletion of completed push records
 - One immutable instance owner plus admin/developer/viewer roles and per-app membership
 - Self-service username/password updates plus owner-managed resets, with other sessions revoked after password changes
@@ -160,6 +161,8 @@ To schedule or cancel a notification locally on devices, send an immediate `back
 
 For a local schedule created by SodaPush, call `POST /v1/apps/:appID/pushes/:jobID/cancel-local` on the **original schedule job** to cancel it. The Server reads its notification identifier and sends a background cancellation command only to devices whose original scheduling push reached APNs. The original record is marked `cancelled` and links to a separate cancellation job for delivery inspection. This endpoint requires the Queue binding and a future local display time; the `cancelled` label means the cancellation request was queued, not that every device executed it. Apply migration `0004_local_cancellation.sql` when updating an existing deployment.
 
+To recall a new alert push, call `POST /v1/apps/:appID/pushes/:jobID/recall` on the original job. New alert jobs set their job ID as the APNs `apns-collapse-id`, which becomes the remote notification request identifier on the device without changing the caller's payload. A queued job is stopped on the Server without an extra push. For a completed or partially successful job, the Server queues a silent recall command for devices whose original delivery was accepted by APNs; the SDK requests removal of that one identifier from Notification Center. The original record reports `recalled` and links to the recall delivery job. This is **best-effort**: APNs acceptance does not prove device delivery, background commands may be delayed or dropped, and removing a Notification Center entry cannot undo an alert already seen or app-owned content. Older alerts without a recall identifier cannot be recalled safely. Apply migration `0005_push_recall.sql` when updating an existing deployment; the production deploy script applies all outstanding migrations.
+
 Supported targets are `{ "all": true }`, `installationIds`, `tags`, `languages`, or `userIDs`. Multiple values within a selector use OR matching. Only active devices in the selected environment are eligible.
 
 Each push record keeps the exact audience selector and APNs payload submitted for that job. Both `GET /v1/apps/:appID/pushes` and `GET /v1/apps/:appID/pushes/:jobID` return the stored `target` and `payload`, so the Admin app and automation can inspect what was sent later. These are request snapshots; changing a device's tags, language, or user ID afterward does not rewrite existing history.
@@ -176,7 +179,7 @@ All HTTP endpoints use only `GET` or `POST`; state changes never use `GET`.
 - APNs credentials: `GET|POST /v1/apps/:appID/apns-credentials`, `POST /v1/apps/:appID/apns-credentials/:credentialID/default|delete`
 - Registration keys: `GET|POST /v1/apps/:appID/registration-keys`, `POST /v1/apps/:appID/registration-keys/:keyID/revoke`
 - Devices: `GET /v1/apps/:appID/devices`, `POST /v1/apps/:appID/devices/:installationID/deactivate`, signed `POST /v1/apps/:appID/devices/:installationID/register|unregister`
-- Pushes: `GET|POST /v1/apps/:appID/pushes`, `POST /v1/apps/:appID/pushes/schedule`, `GET /v1/apps/:appID/pushes/:jobID`, `POST /v1/apps/:appID/pushes/:jobID/cancel-local|delete`
+- Pushes: `GET|POST /v1/apps/:appID/pushes`, `POST /v1/apps/:appID/pushes/schedule`, `GET /v1/apps/:appID/pushes/:jobID`, `POST /v1/apps/:appID/pushes/:jobID/cancel-local|recall|delete`
 - Users/members: `GET|POST /v1/users`, `POST /v1/users/:userID/update`, `GET /v1/apps/:appID/member-candidates`, `GET /v1/apps/:appID/members`, `POST /v1/apps/:appID/members/:userID` and `/remove`
 
 SDK registration requests use `X-Soda-Key-ID`, `X-Soda-Timestamp`, `X-Soda-Nonce`, and `X-Soda-Signature`. The HMAC-SHA256 input covers method, canonical target, timestamp, nonce, and body hash.

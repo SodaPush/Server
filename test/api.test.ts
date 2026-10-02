@@ -1,6 +1,6 @@
 import { createClient, type Client } from "@libsql/client";
 import { beforeEach, describe, expect, it } from "vitest";
-import { app } from "../src/index";
+import { app, processPushJob } from "../src/index";
 import { hmacSha256Base64Url, sha256Base64Url } from "../src/crypto";
 import type { Env } from "../src/types";
 import { readFile } from "node:fs/promises";
@@ -52,7 +52,8 @@ describe("API contract", () => {
     const accounts = await readFile(new URL("../migrations/0002_accounts_pushes.sql", import.meta.url), "utf8");
     const targeting = await readFile(new URL("../migrations/0003_targeting_and_credentials.sql", import.meta.url), "utf8");
     const cancellation = await readFile(new URL("../migrations/0004_local_cancellation.sql", import.meta.url), "utf8");
-    await client.executeMultiple(`${initial}\n${accounts}\n${targeting}\n${cancellation}`);
+    const recall = await readFile(new URL("../migrations/0005_push_recall.sql", import.meta.url), "utf8");
+    await client.executeMultiple(`${initial}\n${accounts}\n${targeting}\n${cancellation}\n${recall}`);
     env = {
       SODAPUSH_DB: new TestDatabase(client) as unknown as D1Database,
       MASTER_KEY: Buffer.alloc(32, 7).toString("base64url"),
@@ -149,6 +150,60 @@ describe("API contract", () => {
     expect(enqueueFailure.status).toBe(500);
     expect((await client.execute("SELECT local_cancelled_at FROM push_jobs WHERE id='another-local'")).rows[0]?.local_cancelled_at).toBeNull();
     expect((await client.execute({ sql: "SELECT COUNT(*) AS count FROM push_jobs WHERE app_id=?", args: [appID] })).rows[0]?.count).toBe(3);
+  });
+
+  it("recalls queued alerts locally and delivered alerts through a background job", async () => {
+    const { appID, accessToken } = await createApplication();
+    const authorization = { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" };
+    const queued: Array<{ jobID: string }> = [];
+    env.PUSH_QUEUE = { send: async (body: { jobID: string }) => { queued.push(body); } } as unknown as Queue;
+    const pushBody = { environment: "production", pushType: "alert", target: { all: true }, payload: { aps: { alert: "Recall me" } } };
+
+    const scheduled = await request(`/v1/apps/${appID}/pushes/schedule`, { method: "POST", headers: authorization, body: JSON.stringify({ ...pushBody, scheduledAt: new Date(Date.now() + 60_000).toISOString() }) });
+    expect(scheduled.status).toBe(202);
+    const scheduledID = (await scheduled.json() as { jobID: string }).jobID;
+    const storedSchedule = await client.execute({ sql: "SELECT request_json FROM push_jobs WHERE id=?", args: [scheduledID] });
+    expect(JSON.parse(String(storedSchedule.rows[0]?.request_json))).toMatchObject({ recallIdentifier: scheduledID });
+    const stopped = await request(`/v1/apps/${appID}/pushes/${scheduledID}/recall`, { method: "POST", headers: authorization });
+    expect(stopped.status).toBe(202);
+    expect((await stopped.json() as { recallJobID: string | null }).recallJobID).toBeNull();
+    await processPushJob(env, scheduledID);
+    expect((await client.execute({ sql: "SELECT status,recalled_at FROM push_jobs WHERE id=?", args: [scheduledID] })).rows[0]).toMatchObject({ status: "queued", recalled_at: expect.any(String) });
+    expect((await request(`/v1/apps/${appID}/pushes/${scheduledID}`, { headers: authorization }).then((response) => response.json()) as { push: { status: string } }).push.status).toBe("recalled");
+    expect((await request(`/v1/apps/${appID}/pushes/${scheduledID}/recall`, { method: "POST", headers: authorization })).status).toBe(409);
+
+    const sent = await request(`/v1/apps/${appID}/pushes`, { method: "POST", headers: authorization, body: JSON.stringify(pushBody) });
+    expect(sent.status).toBe(202);
+    const sentID = (await sent.json() as { jobID: string }).jobID;
+    await client.execute({ sql: "UPDATE push_jobs SET status='completed',success_count=1,total_count=1 WHERE id=?", args: [sentID] });
+    await client.execute({ sql: "INSERT INTO deliveries(id,job_id,device_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?)", args: ["sent-for-recall", sentID, "device-1", "sent", "now", "now"] });
+    env.PUSH_QUEUE = undefined;
+    expect((await request(`/v1/apps/${appID}/pushes/${sentID}/recall`, { method: "POST", headers: authorization })).status).toBe(503);
+    env.PUSH_QUEUE = { send: async () => { throw new Error("Queue unavailable"); } } as unknown as Queue;
+    expect((await request(`/v1/apps/${appID}/pushes/${sentID}/recall`, { method: "POST", headers: authorization })).status).toBe(500);
+    expect((await client.execute({ sql: "SELECT recalled_at,recall_job_id FROM push_jobs WHERE id=?", args: [sentID] })).rows[0]).toMatchObject({ recalled_at: null, recall_job_id: null });
+    expect((await client.execute({ sql: "SELECT COUNT(*) AS count FROM push_jobs WHERE app_id=?", args: [appID] })).rows[0]?.count).toBe(2);
+    env.PUSH_QUEUE = { send: async (body: { jobID: string }) => { queued.push(body); } } as unknown as Queue;
+    const recall = await request(`/v1/apps/${appID}/pushes/${sentID}/recall`, { method: "POST", headers: authorization });
+    expect(recall.status).toBe(202);
+    const recallJobID = (await recall.json() as { recallJobID: string }).recallJobID;
+    expect(queued.at(-1)).toEqual({ jobID: recallJobID });
+    const recallRow = await client.execute({ sql: "SELECT request_json FROM push_jobs WHERE id=?", args: [recallJobID] });
+    expect(JSON.parse(String(recallRow.rows[0]?.request_json))).toMatchObject({ recallOf: sentID, recallIdentifier: sentID, payload: { sodapush: { recallNotification: { identifier: sentID } } } });
+    expect((await request(`/v1/apps/${appID}/pushes/${sentID}/delete`, { method: "POST", headers: authorization })).status).toBe(409);
+  });
+
+  it("does not guess an identifier for alerts created before recall support", async () => {
+    const { appID, accessToken } = await createApplication();
+    await client.execute({
+      sql: "INSERT INTO push_jobs(id,app_id,environment,request_json,status,success_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+      args: ["legacy-alert", appID, "production", JSON.stringify({ pushType: "alert", target: { all: true }, payload: { aps: { alert: "Old" } } }), "completed", 1, "now", "now"],
+    });
+
+    const response = await request(`/v1/apps/${appID}/pushes/legacy-alert/recall`, { method: "POST", headers: { Authorization: `Bearer ${accessToken}` } });
+    expect(response.status).toBe(409);
+    expect((await response.json() as { code: string }).code).toBe("not_recallable");
+    expect((await client.execute("SELECT recalled_at FROM push_jobs WHERE id='legacy-alert'")).rows[0]?.recalled_at).toBeNull();
   });
 
   it("supports the practical management lifecycle without exposing stored secrets", async () => {

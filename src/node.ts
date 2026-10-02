@@ -57,6 +57,10 @@ async function main() {
     const cancellationMigration = await readFile(new URL("../migrations/0004_local_cancellation.sql", import.meta.url), "utf8");
     await client.executeMultiple(cancellationMigration);
   }
+  if (!pushColumns.rows.some((column) => column.name === "recalled_at")) {
+    const recallMigration = await readFile(new URL("../migrations/0005_push_recall.sql", import.meta.url), "utf8");
+    await client.executeMultiple(recallMigration);
+  }
   const port = Number(process.env.PORT ?? "8787");
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw new Error("PORT must be a valid TCP port");
   serve({ fetch: (request) => app.fetch(request, env), port }, (info) => {

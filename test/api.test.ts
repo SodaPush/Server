@@ -152,6 +152,36 @@ describe("API contract", () => {
     expect((await client.execute({ sql: "SELECT COUNT(*) AS count FROM push_jobs WHERE app_id=?", args: [appID] })).rows[0]?.count).toBe(3);
   });
 
+  it("generates a local schedule identifier and reuses it for cancellation", async () => {
+    const { appID, accessToken } = await createApplication();
+    const authorization = { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" };
+    const queued: Array<{ jobID: string }> = [];
+    env.PUSH_QUEUE = { send: async (body: { jobID: string }) => { queued.push(body); } } as unknown as Queue;
+    const fireAt = new Date(Date.now() + 3_600_000).toISOString();
+    const command = { action: "schedule", fireAt, title: "Reminder", body: "Time to check in" };
+    const requestBody = { environment: "production", pushType: "background", target: { all: true }, payload: { aps: { "content-available": 1 }, sodapush: { version: 1, localNotification: command } } };
+
+    const created = await request(`/v1/apps/${appID}/pushes`, { method: "POST", headers: authorization, body: JSON.stringify(requestBody) });
+    expect(created.status).toBe(202);
+    const createdBody = await created.json() as { jobID: string; localNotificationIdentifier: string };
+    expect(createdBody.localNotificationIdentifier).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    const originalRow = await client.execute({ sql: "SELECT request_json FROM push_jobs WHERE id=?", args: [createdBody.jobID] });
+    expect(JSON.parse(String(originalRow.rows[0]?.request_json))).toMatchObject({ payload: { sodapush: { localNotification: { ...command, identifier: createdBody.localNotificationIdentifier } } } });
+    expect(queued).toEqual([{ jobID: createdBody.jobID }]);
+
+    await client.execute({ sql: "UPDATE push_jobs SET status='completed',success_count=1,total_count=1 WHERE id=?", args: [createdBody.jobID] });
+    await client.execute({ sql: "INSERT INTO deliveries(id,job_id,device_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?)", args: ["generated-id-delivery", createdBody.jobID, "device-1", "sent", "now", "now"] });
+    const cancelled = await request(`/v1/apps/${appID}/pushes/${createdBody.jobID}/cancel-local`, { method: "POST", headers: authorization });
+    expect(cancelled.status).toBe(202);
+    const cancellationID = (await cancelled.json() as { jobID: string }).jobID;
+    const cancellationRow = await client.execute({ sql: "SELECT request_json FROM push_jobs WHERE id=?", args: [cancellationID] });
+    expect(JSON.parse(String(cancellationRow.rows[0]?.request_json))).toMatchObject({ payload: { sodapush: { localNotification: { action: "cancel", identifier: createdBody.localNotificationIdentifier } } } });
+
+    const explicit = await request(`/v1/apps/${appID}/pushes`, { method: "POST", headers: authorization, body: JSON.stringify({ ...requestBody, payload: { ...requestBody.payload, sodapush: { version: 1, localNotification: { ...command, identifier: "existing-client-id" } } } }) });
+    expect(explicit.status).toBe(202);
+    expect((await explicit.json() as { localNotificationIdentifier: string }).localNotificationIdentifier).toBe("existing-client-id");
+  });
+
   it("recalls queued alerts locally and delivered alerts through a background job", async () => {
     const { appID, accessToken } = await createApplication();
     const authorization = { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" };

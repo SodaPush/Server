@@ -359,7 +359,18 @@ async function createPush(c: AppContext, scheduleRequired: boolean): Promise<Res
   const validInstallations = installationIds === undefined ? undefined : normalizedStringList(installationIds, 500);
   const selectorCount = [parsed.target.all === true, validInstallations !== undefined, tags !== undefined, languages !== undefined, userIDs !== undefined].filter(Boolean).length;
   if (selectorCount !== 1) return errorResponse(c, 400, "invalid_target", "target must contain exactly one of all, installationIds, tags, languages, or userIDs");
-  if (new TextEncoder().encode(JSON.stringify(parsed.payload)).byteLength > 4096) return errorResponse(c, 413, "payload_too_large", "APNs payload exceeds 4096 bytes");
+  let payload: Record<string, unknown> = parsed.payload;
+  let localNotificationIdentifier: string | null = null;
+  const namespace = payload.sodapush;
+  const command = isRecord(namespace) ? namespace.localNotification : null;
+  if ((parsed.pushType ?? "alert") === "background" && isRecord(namespace) && namespace.version === 1 && isRecord(command) && command.action === "schedule") {
+    if (command.identifier !== undefined && command.identifier !== null && typeof command.identifier !== "string") return errorResponse(c, 400, "invalid_local_notification", "Local notification identifier must be a string");
+    const suppliedIdentifier = typeof command.identifier === "string" ? command.identifier.trim() : "";
+    if (suppliedIdentifier.length > 128) return errorResponse(c, 400, "invalid_local_notification", "Local notification identifier must contain at most 128 characters");
+    localNotificationIdentifier = suppliedIdentifier || crypto.randomUUID();
+    payload = { ...payload, sodapush: { ...namespace, localNotification: { ...command, identifier: localNotificationIdentifier } } };
+  }
+  if (new TextEncoder().encode(JSON.stringify(payload)).byteLength > 4096) return errorResponse(c, 413, "payload_too_large", "APNs payload exceeds 4096 bytes");
   if (parsed.credentialID) {
     const credential = await c.env.SODAPUSH_DB.prepare("SELECT id FROM apns_credentials WHERE app_id=?1 AND id=?2 AND environment=?3 LIMIT 1").bind(appID, parsed.credentialID, parsed.environment).first();
     if (!credential) return errorResponse(c, 400, "invalid_credential", "The selected APNs credential does not match this app and environment");
@@ -378,12 +389,12 @@ async function createPush(c: AppContext, scheduleRequired: boolean): Promise<Res
   if (scheduleRequired && scheduledAt === null) return errorResponse(c, 400, "invalid_schedule", "scheduledAt is required for scheduled delivery");
   const target = parsed.target.all === true ? { all: true } : validInstallations ? { installationIds: validInstallations } : tags ? { tags } : languages ? { languages } : { userIDs };
   const jobID = crypto.randomUUID();
-  const requestJSON = JSON.stringify({ environment: parsed.environment, credentialID: parsed.credentialID ?? null, pushType: parsed.pushType ?? "alert", target, payload: parsed.payload, scheduledAt, recallIdentifier: (parsed.pushType ?? "alert") === "alert" ? jobID : null });
+  const requestJSON = JSON.stringify({ environment: parsed.environment, credentialID: parsed.credentialID ?? null, pushType: parsed.pushType ?? "alert", target, payload, scheduledAt, recallIdentifier: (parsed.pushType ?? "alert") === "alert" ? jobID : null });
   const now = new Date().toISOString();
   await c.env.SODAPUSH_DB.prepare("INSERT INTO push_jobs (id,app_id,environment,request_json,status,created_by,created_at,updated_at) VALUES (?1,?2,?3,?4,'queued',?5,?6,?6)").bind(jobID, appID, parsed.environment, requestJSON, user.id, now).run();
   if (c.env.PUSH_QUEUE) await c.env.PUSH_QUEUE.send({ jobID }, { delaySeconds }); else await processPushJob(c.env, jobID);
   const state = await c.env.SODAPUSH_DB.prepare("SELECT status FROM push_jobs WHERE id=?1").bind(jobID).first<{ status: string }>();
-  return c.json({ jobID, status: state?.status ?? "queued", scheduledAt }, 202);
+  return c.json({ jobID, status: state?.status ?? "queued", scheduledAt, localNotificationIdentifier }, 202);
 }
 
 app.post("/v1/apps/:appID/pushes", (c) => createPush(c, false));
